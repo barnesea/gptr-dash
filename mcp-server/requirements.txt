@@ -1,0 +1,5 @@
+# MCP dependencies
+fastmcp>=2.8.0
+
+# Testing dependencies
+sseclient-py>=1.7.0

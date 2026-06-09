@@ -1,66 +1,68 @@
-# 🔍 GPT Researcher MCP Server
+# GPT Researcher MCP Server
 
-> **Note:** This content has been moved to a dedicated repository: [https://github.com/assafelovic/gptr-mcp](https://github.com/assafelovic/gptr-mcp)
+This directory contains the MCP server that ships with `gptr-dash`. It exposes
+GPT Researcher as MCP tools and resources while importing the local
+`gpt_researcher` package from the repository root.
 
-## Overview
+## Docker Compose
 
-The GPT Researcher MCP Server enables AI assistants like Claude to conduct comprehensive web research and generate detailed reports via the Machine Conversation Protocol (MCP).
+The root Compose stack starts the MCP server over SSE:
 
-## Why GPT Researcher MCP?
+```bash
+docker compose up --build gptr-mcp
+```
 
-While LLM apps can access web search tools with MCP, **GPT Researcher MCP delivers deep research results.** Standard search tools return raw results requiring manual filtering, often containing irrelevant sources and wasting context window space.
+Default endpoints:
 
-GPT Researcher autonomously explores and validates numerous sources, focusing only on relevant, trusted and up-to-date information. Though slightly slower than standard search (~30 seconds wait), it delivers:
+- Health: http://localhost:8001/health
+- SSE: http://localhost:8001/sse
+- Messages: http://localhost:8001/messages/?session_id=YOUR_SESSION_ID
 
-* ✨ Higher quality information
-* 📊 Optimized context usage
-* 🔎 Comprehensive results
-* 🧠 Better reasoning for LLMs
+## Environment
 
-## Features
+Set these in the root `.env` file:
 
-### Resources
-* `research_resource`: Get web resources related to a given task via research.
+```bash
+OPENAI_API_KEY=your_openai_key
+TAVILY_API_KEY=your_tavily_key
+MCP_TRANSPORT=sse
+MCP_PORT=8001
+```
 
-### Primary Tools
-* `deep_research`: Performs deep web research on a topic, finding reliable and relevant information
-* `quick_search`: Performs a fast web search optimized for speed over quality 
-* `write_report`: Generate a report based on research results
-* `get_research_sources`: Get the sources used in the research
-* `get_research_context`: Get the full context of the research
+Optional GPT Researcher settings such as `OPENAI_BASE_URL`,
+`LANGCHAIN_API_KEY`, retriever settings, and model configuration are inherited
+from the same environment.
 
-## Installation
+## Tools
 
-For detailed installation and usage instructions, please visit the [official repository](https://github.com/assafelovic/gptr-mcp).
+- `deep_research`: conduct deep web research and return context plus sources.
+- `quick_search`: perform a faster web search with snippets.
+- `write_report`: generate a report from a previous research session.
+- `get_research_sources`: return the sources for a research session.
+- `get_research_context`: return the full context for a research session.
 
-Quick start:
+## Local STDIO Mode
 
-1. Clone the new repository:
-   ```bash
-   git clone https://github.com/assafelovic/gptr-mcp.git
-   cd gptr-mcp
-   ```
+For clients that spawn MCP servers directly, run from the repo root:
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+MCP_TRANSPORT=stdio python mcp-server/server.py
+```
 
-3. Create a `.env` file with your API keys:
-   ```
-   OPENAI_API_KEY=your_openai_api_key
-   TAVILY_API_KEY=your_tavily_api_key
-   ```
+Example local client command:
 
-4. Run the server:
-   ```bash
-   python server.py
-   ```
-
-For Docker deployment, Claude Desktop integration, example usage, and troubleshooting, please refer to the [full documentation](https://github.com/assafelovic/gptr-mcp).
-
-## Support & Contact
-
-* Website: [gptr.dev](https://gptr.dev)
-* Email: assaf.elovic@gmail.com
-* GitHub: [assafelovic/gptr-mcp](https://github.com/assafelovic/gptr-mcp) :-)
+```json
+{
+  "mcpServers": {
+    "gptr-dash": {
+      "command": "python",
+      "args": ["/home/pichiad/workspaces/gptr-dash/mcp-server/server.py"],
+      "env": {
+        "OPENAI_API_KEY": "your-openai-key",
+        "TAVILY_API_KEY": "your-tavily-key",
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+```
