@@ -19,6 +19,12 @@ const Header = ({ loading, isStopped, showResult, onStop, onNewResearch, isCopil
       {/* Header container */}
       <div className="container relative h-[60px] px-4 lg:h-[80px] lg:px-0 pt-4 pb-4">
         <div className="flex flex-col items-center">
+          <a
+            href="/config"
+            className="absolute right-4 top-4 rounded-md border border-slate-700/70 px-3 py-1 text-xs text-slate-200 transition hover:border-teal-400 hover:text-teal-200"
+          >
+            Config
+          </a>
           {/* Logo/Home link */}
           <a href="/">
             <img

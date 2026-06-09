@@ -32,6 +32,12 @@ from server.agent_discovery import build_agent_discovery_document
 from server.websocket_manager import run_agent
 from utils import write_md_to_word, write_md_to_pdf
 from gpt_researcher.utils.enum import Tone
+from gpt_researcher.config.runtime import (
+    apply_runtime_overrides,
+    runtime_config_snapshot,
+    update_runtime_overrides,
+    write_runtime_overrides,
+)
 from chat.chat import ChatAgentWithMemory
 
 from server.report_store import ReportStore
@@ -72,6 +78,8 @@ class ChatRequest(BaseModel):
 async def lifespan(app: FastAPI):
     # Startup
     os.makedirs("outputs", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+    apply_runtime_overrides()
     app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
     
     # Mount frontend static files
@@ -282,6 +290,29 @@ async def add_report_chat_message(research_id: str, request: Request):
 
     await report_store.upsert_report(research_id, updated)
     return {"success": True, "id": research_id}
+
+
+@app.get("/api/config")
+async def get_runtime_config():
+    return runtime_config_snapshot()
+
+
+@app.put("/api/config")
+async def update_runtime_config(request: Request):
+    data = await request.json()
+    overrides = data.get("overrides")
+    if not isinstance(overrides, dict):
+        raise HTTPException(status_code=400, detail="Expected 'overrides' object")
+    persist = bool(data.get("persist", True))
+    return update_runtime_overrides(overrides, persist=persist)
+
+
+@app.delete("/api/config")
+async def reset_runtime_config():
+    for key in runtime_config_snapshot()["overrides"].keys():
+        os.environ.pop(key, None)
+    write_runtime_overrides({})
+    return runtime_config_snapshot()
 
 
 async def write_report(research_request: ResearchRequest, research_id: str = None):
