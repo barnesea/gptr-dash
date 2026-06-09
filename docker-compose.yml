@@ -4,13 +4,19 @@ services:
     image: gptresearcher/gpt-researcher
     build: ./
     environment: 
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
-      TAVILY_API_KEY: ${TAVILY_API_KEY}
-      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-llama-swap}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      LLAMA_SWAP_URL: ${LLAMA_SWAP_URL:-http://host.docker.internal:8080}
+      LLAMA_SWAP_ENABLED: ${LLAMA_SWAP_ENABLED:-true}
+      LLAMA_SWAP_TIMEOUT: ${LLAMA_SWAP_TIMEOUT:-1.0}
+      FAST_LLM: ${FAST_LLM:-}
+      SMART_LLM: ${SMART_LLM:-}
+      STRATEGIC_LLM: ${STRATEGIC_LLM:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
       LOGGING_LEVEL: INFO
       # Image generation (optional - set to enable inline images in reports)
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       IMAGE_GENERATION_ENABLED: ${IMAGE_GENERATION_ENABLED:-false}
       IMAGE_GENERATION_MODEL: ${IMAGE_GENERATION_MODEL:-gemini-2.0-flash-preview-image-generation}
       IMAGE_GENERATION_MAX_IMAGES: ${IMAGE_GENERATION_MAX_IMAGES:-3}
@@ -18,7 +24,10 @@ services:
       - ${PWD}/my-docs:/usr/src/app/my-docs:rw
       - ${PWD}/outputs:/usr/src/app/outputs:rw
       - ${PWD}/logs:/usr/src/app/logs:rw
+      - ${PWD}/data:/usr/src/app/data:rw
     user: root
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: always
     ports:
       - 8000:8000
@@ -30,8 +39,9 @@ services:
     environment:
       CHOKIDAR_USEPOLLING: "true"
       LOGGING_LEVEL: INFO
-      NEXT_PUBLIC_GA_MEASUREMENT_ID: ${NEXT_PUBLIC_GA_MEASUREMENT_ID}
-      NEXT_PUBLIC_GPTR_API_URL: ${NEXT_PUBLIC_GPTR_API_URL}
+      GPTR_API_URL: ${GPTR_API_URL:-http://gpt-researcher:8000}
+      NEXT_PUBLIC_GA_MEASUREMENT_ID: ${NEXT_PUBLIC_GA_MEASUREMENT_ID:-}
+      NEXT_PUBLIC_GPTR_API_URL: ${NEXT_PUBLIC_GPTR_API_URL:-}
     build:
       dockerfile: Dockerfile.dev
       context: frontend/nextjs
@@ -44,14 +54,51 @@ services:
     ports:
       - 3000:3000
 
+  gptr-mcp:
+    pull_policy: build
+    image: gptr-dash/gptr-mcp
+    build:
+      context: .
+      dockerfile: mcp-server/Dockerfile
+    environment:
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-sse}
+      MCP_PORT: ${MCP_PORT:-8001}
+      DOCKER_CONTAINER: "true"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-llama-swap}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      LLAMA_SWAP_URL: ${LLAMA_SWAP_URL:-http://host.docker.internal:8080}
+      LLAMA_SWAP_ENABLED: ${LLAMA_SWAP_ENABLED:-true}
+      LLAMA_SWAP_TIMEOUT: ${LLAMA_SWAP_TIMEOUT:-1.0}
+      FAST_LLM: ${FAST_LLM:-}
+      SMART_LLM: ${SMART_LLM:-}
+      STRATEGIC_LLM: ${STRATEGIC_LLM:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
+      LOGGING_LEVEL: INFO
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${PWD}/logs:/app/logs:rw
+      - ${PWD}/data:/app/data:rw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+    ports:
+      - 8001:8001
+
   gpt-researcher-tests:
     image: gptresearcher/gpt-researcher-tests
     build: ./
     environment: 
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
-      TAVILY_API_KEY: ${TAVILY_API_KEY}
-      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-llama-swap}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      LLAMA_SWAP_URL: ${LLAMA_SWAP_URL:-http://host.docker.internal:8080}
+      LLAMA_SWAP_ENABLED: ${LLAMA_SWAP_ENABLED:-true}
+      LLAMA_SWAP_TIMEOUT: ${LLAMA_SWAP_TIMEOUT:-1.0}
+      FAST_LLM: ${FAST_LLM:-}
+      SMART_LLM: ${SMART_LLM:-}
+      STRATEGIC_LLM: ${STRATEGIC_LLM:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
       LOGGING_LEVEL: INFO
     profiles: ["test"]
     command: >
@@ -66,8 +113,8 @@ services:
       context: ./docs/discord-bot
       dockerfile: Dockerfile.dev
     environment:
-      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
-      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID:-}
     volumes:
       - ./docs/discord-bot:/app
       - /app/node_modules

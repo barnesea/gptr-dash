@@ -49,3 +49,6 @@ class BaseConfig(TypedDict):
     IMAGE_GENERATION_ENABLED: bool
     IMAGE_GENERATION_STYLE: str  # Image style: "dark", "light", or "auto"
     IMAGE_GENERATION_PROVIDER: str  # Image provider: "google" or "modelslab"
+    LLAMA_SWAP_URL: str
+    LLAMA_SWAP_ENABLED: bool
+    LLAMA_SWAP_TIMEOUT: float

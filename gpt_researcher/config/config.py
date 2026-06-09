@@ -7,11 +7,14 @@ retrievers, and various operational parameters.
 
 import json
 import os
+import urllib.error
+import urllib.request
 import warnings
 from typing import Any, Dict, List, Type, Union, get_args, get_origin
 
 from gpt_researcher.llm_provider.generic.base import ReasoningEfforts
 
+from .runtime import apply_runtime_overrides
 from .variables.base import BaseConfig
 from .variables.default import DEFAULT_CONFIG
 
@@ -41,7 +44,9 @@ class Config:
         self.llm_kwargs: Dict[str, Any] = {}
         self.embedding_kwargs: Dict[str, Any] = {}
 
+        apply_runtime_overrides()
         config_to_use = self.load_config(config_path)
+        self._apply_llama_swap_defaults(config_to_use)
         self._set_attributes(config_to_use)
         self._set_embedding_attributes()
         self._set_llm_attributes()
@@ -70,7 +75,7 @@ class Config:
         """
         for key, value in config.items():
             env_value = os.getenv(key)
-            if env_value is not None:
+            if env_value not in (None, ""):
                 value = self.convert_env_value(key, env_value, BaseConfig.__annotations__[key])
             setattr(self, key.lower(), value)
 
@@ -81,6 +86,107 @@ class Config:
         except ValueError as e:
             print(f"Warning: {str(e)}. Defaulting to 'tavily' retriever.")
             self.retrievers = ["tavily"]
+
+    def _apply_llama_swap_defaults(self, config: Dict[str, Any]) -> None:
+        """Use llama-swap's currently running model as the default local LLM.
+
+        Explicit environment variables and custom config file values continue to
+        win. This only replaces the built-in OpenAI defaults.
+        """
+        enabled = self.convert_env_value(
+            "LLAMA_SWAP_ENABLED",
+            os.getenv("LLAMA_SWAP_ENABLED") or str(config.get("LLAMA_SWAP_ENABLED", True)),
+            bool,
+        )
+        if not enabled:
+            return
+
+        llm_keys = ("FAST_LLM", "SMART_LLM", "STRATEGIC_LLM")
+        needs_default = [
+            key for key in llm_keys
+            if not os.getenv(key) and config.get(key) == DEFAULT_CONFIG[key]
+        ]
+        if not needs_default:
+            return
+
+        model, base_url = self._get_llama_swap_running_model(config)
+        if not model:
+            return
+
+        for key in needs_default:
+            config[key] = f"openai:{model}"
+
+        if not os.getenv("OPENAI_BASE_URL"):
+            os.environ["OPENAI_BASE_URL"] = self._llama_swap_openai_base_url(base_url)
+        if not os.getenv("OPENAI_API_KEY"):
+            os.environ["OPENAI_API_KEY"] = "llama-swap"
+
+    @classmethod
+    def _get_llama_swap_running_model(cls, config: Dict[str, Any]) -> tuple[str | None, str]:
+        base_url, running_url = cls._llama_swap_urls(
+            os.getenv("LLAMA_SWAP_URL") or str(config.get("LLAMA_SWAP_URL", "http://localhost:8080"))
+        )
+        timeout = float(os.getenv("LLAMA_SWAP_TIMEOUT") or config.get("LLAMA_SWAP_TIMEOUT", 1.0))
+
+        try:
+            with urllib.request.urlopen(running_url, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+            return None, base_url
+
+        return cls._extract_llama_swap_model(payload), base_url
+
+    @staticmethod
+    def _llama_swap_urls(url: str) -> tuple[str, str]:
+        normalized = url.rstrip("/")
+        if normalized.endswith("/running"):
+            return normalized[: -len("/running")], normalized
+        if normalized.endswith("/v1"):
+            normalized = normalized[: -len("/v1")]
+        return normalized, f"{normalized}/running"
+
+    @staticmethod
+    def _llama_swap_openai_base_url(base_url: str) -> str:
+        return f"{base_url.rstrip('/')}/v1"
+
+    @classmethod
+    def _extract_llama_swap_model(cls, payload: Any) -> str | None:
+        running = payload.get("running") if isinstance(payload, dict) else payload
+        if isinstance(running, dict):
+            running = [
+                {"model": model, **(state if isinstance(state, dict) else {"state": state})}
+                for model, state in running.items()
+            ]
+        if not isinstance(running, list):
+            return None
+
+        preferred = ("running", "ready", "started", "healthy")
+        candidates: list[tuple[int, str]] = []
+        for index, entry in enumerate(running):
+            model = cls._model_from_running_entry(entry)
+            if not model:
+                continue
+            state = ""
+            if isinstance(entry, dict):
+                state = str(entry.get("state", "")).lower()
+            priority = 0 if state in preferred else 1
+            candidates.append((priority * 1000 + index, model))
+
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda item: item[0])[0][1]
+
+    @staticmethod
+    def _model_from_running_entry(entry: Any) -> str | None:
+        if isinstance(entry, str):
+            return entry or None
+        if not isinstance(entry, dict):
+            return None
+        for key in ("model", "id", "name"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
 
     def _set_embedding_attributes(self) -> None:
         """Parse and set embedding provider and model attributes."""
@@ -158,7 +264,7 @@ class Config:
         """Load a configuration by name."""
         config_path = config_path or os.environ.get("CONFIG_PATH")
         if not config_path:
-            return DEFAULT_CONFIG
+            return DEFAULT_CONFIG.copy()
 
         # config_path = os.path.join(cls.CONFIG_DIR, config_path)
         if not os.path.exists(config_path):
@@ -166,7 +272,7 @@ class Config:
                 print(f"Warning: Configuration not found at '{config_path}'. Using default configuration.")
                 if not config_path.endswith(".json"):
                     print(f"Do you mean '{config_path}.json'?")
-            return DEFAULT_CONFIG
+            return DEFAULT_CONFIG.copy()
 
         with open(config_path, "r") as f:
             custom_config = json.load(f)

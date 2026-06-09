@@ -1,3 +1,70 @@
+# gptr-dash
+
+`gptr-dash` combines GPT Researcher, the Next.js web UI, and the GPT Researcher
+MCP server in one repo.
+
+## Run the full stack
+
+Create a `.env` file from `.env.example`, add your API keys, then start
+everything with Docker Compose:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Services:
+
+- Web UI: http://localhost:3000
+- Runtime config: http://localhost:3000/config
+- GPT Researcher backend API: http://localhost:8000
+- MCP health check: http://localhost:8001/health
+- MCP SSE endpoint: http://localhost:8001/sse
+- MCP messages endpoint: http://localhost:8001/messages/?session_id=YOUR_SESSION_ID
+
+The MCP server runs as the `gptr-mcp` Compose service and imports the local
+`gpt_researcher` package from this repo.
+
+The runtime config page writes saved overrides to `data/runtime-config.json`.
+Those overrides are shared by the backend and MCP service through the Compose
+`data/` volume.
+
+## Local LLM defaults with llama-swap
+
+If `FAST_LLM`, `SMART_LLM`, and `STRATEGIC_LLM` are not set, `gptr-dash`
+defaults to the model currently loaded in a running llama-swap instance.
+
+By default, Docker services call:
+
+```text
+http://host.docker.internal:8080/running
+```
+
+and use the first running model as:
+
+```text
+openai:<running-model-id>
+```
+
+for fast, smart, and strategic LLM roles. The OpenAI-compatible base URL is
+then set to:
+
+```text
+http://host.docker.internal:8080/v1
+```
+
+Override this by setting any of:
+
+```bash
+LLAMA_SWAP_URL=http://host.docker.internal:8080
+FAST_LLM=openai:your-model-id
+SMART_LLM=openai:your-model-id
+STRATEGIC_LLM=openai:your-model-id
+OPENAI_BASE_URL=http://host.docker.internal:8080/v1
+```
+
+## Original GPT Researcher docs
+
 <div align="center" id="top">
 
 <img src="https://github.com/assafelovic/gpt-researcher/assets/13554167/20af8286-b386-44a5-9a83-3be1365139c3" alt="Logo" width="80">
@@ -239,9 +306,10 @@ If that doesn't work, try running it without the dash:
 docker compose up --build
 ```
 
-> **Step 4** - By default, if you haven't uncommented anything in your docker-compose file, this flow will start 2 processes:
+> **Step 4** - By default, this flow starts 3 processes:
  - the Python server running on localhost:8000<br>
  - the React app running on localhost:3000<br>
+ - the MCP server running on localhost:8001<br>
 
 Visit localhost:3000 on any browser and enjoy researching!
 
@@ -263,17 +331,19 @@ Step 2:
 
 ## 🤖 MCP Server
 
-We've moved our MCP server to a dedicated repository: [gptr-mcp](https://github.com/assafelovic/gptr-mcp).
-
-The GPT Researcher MCP Server enables AI applications like Claude to conduct deep research. While LLM apps can access web search tools with MCP, GPT Researcher MCP delivers deeper, more reliable research results.
+The GPT Researcher MCP Server is included in this repo under `mcp-server/`.
+It enables AI applications to conduct deep research through MCP while using the
+local `gpt_researcher` source in this checkout.
 
 Features:
 - Deep research capabilities for AI assistants
 - Higher quality information with optimized context usage
 - Comprehensive results with better reasoning for LLMs
-- Claude Desktop integration
+- SSE transport for Docker and web clients on http://localhost:8001/sse
+- Local STDIO mode for clients that spawn MCP servers directly
 
-For detailed installation and usage instructions, please visit the [official repository](https://github.com/assafelovic/gptr-mcp).
+See [mcp-server/README.md](mcp-server/README.md) for endpoints, environment
+variables, and client configuration examples.
 
 
 ## 👪 Multi-Agent Assistant

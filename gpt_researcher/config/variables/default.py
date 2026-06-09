@@ -52,4 +52,9 @@ DEFAULT_CONFIG: BaseConfig = {
     "IMAGE_GENERATION_ENABLED": False,  # Master switch for inline image generation
     "IMAGE_GENERATION_STYLE": "dark",  # Image style: "dark" (matches app theme), "light", or "auto"
     "IMAGE_GENERATION_PROVIDER": "google",  # Image provider: "google" or "modelslab"
+
+    # llama-swap defaults for local OpenAI-compatible model routing.
+    "LLAMA_SWAP_URL": "http://localhost:8080",
+    "LLAMA_SWAP_ENABLED": True,
+    "LLAMA_SWAP_TIMEOUT": 1.0,
 }
