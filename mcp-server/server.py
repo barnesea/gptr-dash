@@ -9,6 +9,7 @@ import os
 import sys
 import uuid
 import logging
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
@@ -50,6 +51,40 @@ mcp = FastMCP(
 # Initialize researchers dictionary
 if not hasattr(mcp, "researchers"):
     mcp.researchers = {}
+
+_deep_research_semaphore: asyncio.Semaphore | None = None
+_deep_research_semaphore_limit: int | None = None
+
+
+def get_deep_research_limit() -> int:
+    """Return max concurrent deep_research jobs. Zero disables the limit."""
+    raw_limit = os.getenv("MCP_MAX_CONCURRENT_DEEP_RESEARCH", "1").strip()
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        logger.warning(
+            "Invalid MCP_MAX_CONCURRENT_DEEP_RESEARCH=%r, defaulting to 1",
+            raw_limit,
+        )
+        return 1
+
+    return max(limit, 0)
+
+
+def get_deep_research_semaphore() -> asyncio.Semaphore | None:
+    """Create or return the process-local deep research semaphore."""
+    global _deep_research_semaphore, _deep_research_semaphore_limit
+
+    limit = get_deep_research_limit()
+    if limit == 0:
+        return None
+
+    if _deep_research_semaphore is None or _deep_research_semaphore_limit != limit:
+        _deep_research_semaphore = asyncio.Semaphore(limit)
+        _deep_research_semaphore_limit = limit
+        logger.info("Limiting MCP deep_research concurrency to %s job(s)", limit)
+
+    return _deep_research_semaphore
 
 
 @mcp.resource("research://{topic}")
@@ -109,6 +144,17 @@ async def deep_research(query: str) -> Dict[str, Any]:
         Dict containing research status, ID, and the actual research context and sources
         that can be used directly by LLMs for context enrichment
     """
+    semaphore = get_deep_research_semaphore()
+    if semaphore is not None:
+        logger.info("Waiting for deep_research concurrency slot for query: %s", query)
+        async with semaphore:
+            return await _run_deep_research(query)
+
+    return await _run_deep_research(query)
+
+
+async def _run_deep_research(query: str) -> Dict[str, Any]:
+    """Run a deep research job after concurrency admission."""
     logger.info(f"Conducting research on query: {query}...")
     
     # Generate a unique ID for this research session

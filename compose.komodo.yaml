@@ -102,6 +102,8 @@ services:
     environment:
       MCP_TRANSPORT: ${GPTR_MCP_TRANSPORT:-streamable-http}
       MCP_PORT: "8001"
+      MCP_PATH: ${GPTR_MCP_PATH:-/mcp}
+      MCP_MAX_CONCURRENT_DEEP_RESEARCH: ${GPTR_MCP_MAX_CONCURRENT_DEEP_RESEARCH:-1}
       DOCKER_CONTAINER: "true"
       PYTHONUNBUFFERED: "1"
       OPENAI_API_KEY: ${OPENAI_API_KEY:-llama-swap}
