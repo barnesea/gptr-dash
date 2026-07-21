@@ -1,0 +1,162 @@
+services:
+  gpt-researcher:
+    build:
+      context: .
+      labels:
+        homelab.keep: "true"
+        homelab.local-build: "true"
+        homelab.prune-policy: "protected"
+    image: gptr-dash/gpt-researcher:latest
+    container_name: gpt-researcher
+    pull_policy: never
+    user: root
+    restart: unless-stopped
+    ports:
+      - "${GPTR_BACKEND_PORT:-8000}:8000"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-llama-swap}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://llama-swap:9292/v1}
+      LLAMA_SWAP_URL: ${LLAMA_SWAP_URL:-http://llama-swap:9292}
+      LLAMA_SWAP_ENABLED: ${LLAMA_SWAP_ENABLED:-true}
+      LLAMA_SWAP_TIMEOUT: ${LLAMA_SWAP_TIMEOUT:-1.0}
+      FAST_LLM: ${FAST_LLM:-}
+      SMART_LLM: ${SMART_LLM:-}
+      STRATEGIC_LLM: ${STRATEGIC_LLM:-}
+      EMBEDDING: ${EMBEDDING:-openai:qwen3-embedding-4b}
+      RERANKER_MODEL: ${RERANKER_MODEL:-qwen3-reranker-4b}
+      RERANKER_BASE_URL: ${RERANKER_BASE_URL:-http://llama-swap:9292/v1}
+      RERANKER_TIMEOUT_S: ${RERANKER_TIMEOUT_S:-60}
+      MAX_ITERATIONS: ${GPTR_MAX_ITERATIONS:-2}
+      RETRIEVER: ${GPTR_RETRIEVER:-searxng}
+      SEARXNG_URL: ${GPTR_SEARXNG_URL:-http://searxng:8080}
+      SEARX_URL: ${GPTR_SEARX_URL:-http://searxng:8080}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SCRAPER: ${GPTR_SCRAPER:-crawl4ai}
+      CRAWL4AI_BASE_URL: ${CRAWL4AI_BASE_URL:-http://crawl4ai:11235}
+      CRAWL4AI_FILTER: ${CRAWL4AI_FILTER:-fit}
+      CRAWL4AI_TIMEOUT_S: ${CRAWL4AI_TIMEOUT_S:-90}
+      CRAWL4AI_MAX_CONTENT_CHARS: ${CRAWL4AI_MAX_CONTENT_CHARS:-0}
+      SMART_TOKEN_LIMIT: ${SMART_TOKEN_LIMIT:-}
+      FAST_TOKEN_LIMIT: ${FAST_TOKEN_LIMIT:-}
+      STRATEGIC_TOKEN_LIMIT: ${STRATEGIC_TOKEN_LIMIT:-}
+      TOTAL_WORDS: ${TOTAL_WORDS:-1200}
+      SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.42}
+      DEEP_RESEARCH_BREADTH: ${DEEP_RESEARCH_BREADTH:-3}
+      DEEP_RESEARCH_DEPTH: ${DEEP_RESEARCH_DEPTH:-2}
+      DEEP_RESEARCH_CONCURRENCY: ${DEEP_RESEARCH_CONCURRENCY:-4}
+      MAX_SEARCH_RESULTS_PER_QUERY: ${MAX_SEARCH_RESULTS_PER_QUERY:-5}
+      CURATE_SOURCES: ${CURATE_SOURCES:-false}
+      BROWSE_CHUNK_MAX_LENGTH: ${BROWSE_CHUNK_MAX_LENGTH:-8192}
+      SUMMARY_TOKEN_LIMIT: ${SUMMARY_TOKEN_LIMIT:-700}
+      LOGGING_LEVEL: ${GPTR_LOG_LEVEL:-INFO}
+      LOG_LEVEL: ${GPTR_LOG_LEVEL:-INFO}
+      GPTR_CUSTOM_REPORT_PROMPT: ${GPTR_CUSTOM_REPORT_PROMPT:-}
+    volumes:
+      - ${GPTR_STATE_ROOT:-/home/pichiad/pichiciego-homelab/state/config/gptr-dash}/my-docs:/usr/src/app/my-docs:rw
+      - ${GPTR_STATE_ROOT:-/home/pichiad/pichiciego-homelab/state/config/gptr-dash}/outputs:/usr/src/app/outputs:rw
+      - ${GPTR_STATE_ROOT:-/home/pichiad/pichiciego-homelab/state/config/gptr-dash}/logs:/usr/src/app/logs:rw
+      - ${GPTR_STATE_ROOT:-/home/pichiad/pichiciego-homelab/state/config/gptr-dash}/data:/usr/src/app/data:rw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - swag-net
+
+  gptr-nextjs:
+    build:
+      context: ./frontend/nextjs
+      dockerfile: Dockerfile
+      labels:
+        homelab.keep: "true"
+        homelab.local-build: "true"
+        homelab.prune-policy: "protected"
+    image: gptr-dash/gptr-nextjs:latest
+    container_name: gptr-nextjs
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      - gpt-researcher
+    ports:
+      - "${GPTR_WEBUI_PORT:-3000}:3000"
+    environment:
+      LOGGING_LEVEL: ${GPTR_LOG_LEVEL:-INFO}
+      GPTR_API_URL: ${GPTR_API_URL:-http://gpt-researcher:8000}
+      NEXT_PUBLIC_GA_MEASUREMENT_ID: ${NEXT_PUBLIC_GA_MEASUREMENT_ID:-}
+      NEXT_PUBLIC_GPTR_API_URL: ${NEXT_PUBLIC_GPTR_API_URL:-}
+    networks:
+      - swag-net
+
+  gpt-researcher-mcp:
+    build:
+      context: .
+      dockerfile: mcp-server/Dockerfile
+      labels:
+        homelab.keep: "true"
+        homelab.local-build: "true"
+        homelab.prune-policy: "protected"
+    image: gptr-dash/gptr-mcp:latest
+    container_name: gpt-researcher-mcp
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "${GPTR_MCP_PORT:-8001}:8001"
+    environment:
+      MCP_TRANSPORT: ${GPTR_MCP_TRANSPORT:-streamable-http}
+      MCP_PORT: "8001"
+      DOCKER_CONTAINER: "true"
+      PYTHONUNBUFFERED: "1"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-llama-swap}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://llama-swap:9292/v1}
+      LLAMA_SWAP_URL: ${LLAMA_SWAP_URL:-http://llama-swap:9292}
+      LLAMA_SWAP_ENABLED: ${LLAMA_SWAP_ENABLED:-true}
+      LLAMA_SWAP_TIMEOUT: ${LLAMA_SWAP_TIMEOUT:-1.0}
+      FAST_LLM: ${FAST_LLM:-}
+      SMART_LLM: ${SMART_LLM:-}
+      STRATEGIC_LLM: ${STRATEGIC_LLM:-}
+      EMBEDDING: ${EMBEDDING:-openai:qwen3-embedding-4b}
+      RERANKER_MODEL: ${RERANKER_MODEL:-qwen3-reranker-4b}
+      RERANKER_BASE_URL: ${RERANKER_BASE_URL:-http://llama-swap:9292/v1}
+      RERANKER_TIMEOUT_S: ${RERANKER_TIMEOUT_S:-60}
+      MAX_ITERATIONS: ${GPTR_MAX_ITERATIONS:-2}
+      RETRIEVER: ${GPTR_RETRIEVER:-searxng}
+      SEARXNG_URL: ${GPTR_SEARXNG_URL:-http://searxng:8080}
+      SEARX_URL: ${GPTR_SEARX_URL:-http://searxng:8080}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SCRAPER: ${GPTR_SCRAPER:-crawl4ai}
+      CRAWL4AI_BASE_URL: ${CRAWL4AI_BASE_URL:-http://crawl4ai:11235}
+      CRAWL4AI_FILTER: ${CRAWL4AI_FILTER:-fit}
+      CRAWL4AI_TIMEOUT_S: ${CRAWL4AI_TIMEOUT_S:-90}
+      CRAWL4AI_MAX_CONTENT_CHARS: ${CRAWL4AI_MAX_CONTENT_CHARS:-0}
+      SMART_TOKEN_LIMIT: ${SMART_TOKEN_LIMIT:-}
+      FAST_TOKEN_LIMIT: ${FAST_TOKEN_LIMIT:-}
+      STRATEGIC_TOKEN_LIMIT: ${STRATEGIC_TOKEN_LIMIT:-}
+      TOTAL_WORDS: ${TOTAL_WORDS:-1200}
+      SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.42}
+      DEEP_RESEARCH_BREADTH: ${DEEP_RESEARCH_BREADTH:-3}
+      DEEP_RESEARCH_DEPTH: ${DEEP_RESEARCH_DEPTH:-2}
+      DEEP_RESEARCH_CONCURRENCY: ${DEEP_RESEARCH_CONCURRENCY:-4}
+      MAX_SEARCH_RESULTS_PER_QUERY: ${MAX_SEARCH_RESULTS_PER_QUERY:-5}
+      CURATE_SOURCES: ${CURATE_SOURCES:-false}
+      BROWSE_CHUNK_MAX_LENGTH: ${BROWSE_CHUNK_MAX_LENGTH:-8192}
+      SUMMARY_TOKEN_LIMIT: ${SUMMARY_TOKEN_LIMIT:-700}
+      LOGGING_LEVEL: ${GPTR_LOG_LEVEL:-INFO}
+      LOG_LEVEL: ${GPTR_LOG_LEVEL:-INFO}
+      GPTR_CUSTOM_REPORT_PROMPT: ${GPTR_CUSTOM_REPORT_PROMPT:-}
+    volumes:
+      - ${GPTR_STATE_ROOT:-/home/pichiad/pichiciego-homelab/state/config/gptr-dash}/my-docs:/app/my-docs:rw
+      - ${GPTR_STATE_ROOT:-/home/pichiad/pichiciego-homelab/state/config/gptr-dash}/outputs:/app/outputs:rw
+      - ${GPTR_STATE_ROOT:-/home/pichiad/pichiciego-homelab/state/config/gptr-dash}/logs:/app/logs:rw
+      - ${GPTR_STATE_ROOT:-/home/pichiad/pichiciego-homelab/state/config/gptr-dash}/data:/app/data:rw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - swag-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  swag-net:
+    external: true
