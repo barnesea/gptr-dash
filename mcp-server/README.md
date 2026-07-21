@@ -6,7 +6,7 @@ GPT Researcher as MCP tools and resources while importing the local
 
 ## Docker Compose
 
-The root Compose stack starts the MCP server over SSE:
+The root Compose stack starts the MCP server over SSE by default:
 
 ```bash
 docker compose up --build gptr-mcp
@@ -17,6 +17,7 @@ Default endpoints:
 - Health: http://localhost:8001/health
 - SSE: http://localhost:8001/sse
 - Messages: http://localhost:8001/messages/?session_id=YOUR_SESSION_ID
+- Streamable HTTP: http://localhost:8001/mcp when `MCP_TRANSPORT=streamable-http`
 
 ## Environment
 
@@ -27,6 +28,9 @@ OPENAI_API_KEY=your_openai_key
 TAVILY_API_KEY=your_tavily_key
 MCP_TRANSPORT=sse
 MCP_PORT=8001
+# Optional for Streamable HTTP clients such as Open WebUI:
+# MCP_TRANSPORT=streamable-http
+# MCP_PATH=/mcp
 ```
 
 Optional GPT Researcher settings such as `OPENAI_BASE_URL`,

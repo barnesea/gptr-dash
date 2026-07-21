@@ -287,14 +287,19 @@ def run_server():
         logger.error("OPENAI_API_KEY not found. Please set it in your .env file.")
         return
 
-    # Determine transport based on environment
-    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    # Determine transport based on environment.
+    transport = os.getenv("MCP_TRANSPORT")
     port = int(os.getenv("MCP_PORT", "8001"))
+    is_docker = bool(os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER"))
+
+    if not transport:
+        transport = "sse" if is_docker else "stdio"
+        if is_docker:
+            logger.info("Docker environment detected, defaulting to SSE transport")
     
-    # Auto-detect Docker environment
-    if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER"):
-        transport = "sse"
-        logger.info("Docker environment detected, using SSE transport")
+    transport = transport.lower().replace("_", "-")
+    if transport == "http":
+        transport = "streamable-http"
     
     # Add startup message
     logger.info(f"Starting GPT Researcher MCP Server with {transport} transport...")
@@ -309,7 +314,14 @@ def run_server():
         elif transport == "sse":
             mcp.run(transport="sse", host="0.0.0.0", port=port)
         elif transport == "streamable-http":
-            mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+            mcp_path = os.getenv("MCP_PATH", "/mcp")
+            logger.info(f"Using streamable HTTP endpoint at {mcp_path}")
+            mcp.run(
+                transport="streamable-http",
+                host="0.0.0.0",
+                port=port,
+                path=mcp_path,
+            )
         else:
             raise ValueError(f"Unsupported transport: {transport}")
             
