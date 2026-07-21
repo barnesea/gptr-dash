@@ -94,8 +94,9 @@ See the [Documentation](https://docs.gptr.dev/docs/gpt-researcher/getting-starte
 ### Komodo Homelab Stack
 
 This fork includes `compose.komodo.yaml` for a Komodo repo-backed stack. Komodo
-can clone the GitHub repo, run `docker compose build`, and redeploy the backend,
-Next.js UI, and MCP containers when the stack webhook receives a GitHub update.
+can clone or pull the GitHub repo during a stack deploy, run
+`docker compose build`, and redeploy the backend, Next.js UI, and MCP
+containers from the freshly built images.
 
 ## ⚙️ Getting Started
 
