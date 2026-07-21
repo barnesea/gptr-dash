@@ -17,12 +17,19 @@ class Crawl4AIScraper:
         self.content_filter = os.getenv("CRAWL4AI_FILTER", "fit")
         self.timeout = float(os.getenv("CRAWL4AI_TIMEOUT_S", "90"))
         self.max_content_chars = int(os.getenv("CRAWL4AI_MAX_CONTENT_CHARS", "0") or 0)
+        self.api_token = os.getenv("CRAWL4AI_API_TOKEN", "")
 
     def scrape(self) -> tuple[str, list[dict[str, Any]], str]:
         try:
+            headers = (
+                {"Authorization": f"Bearer {self.api_token}"}
+                if self.api_token
+                else None
+            )
             response = self.session.post(
                 f"{self.base_url}/md",
                 json={"url": self.link, "f": self.content_filter},
+                headers=headers,
                 timeout=self.timeout,
             )
             response.raise_for_status()

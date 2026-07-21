@@ -27,8 +27,10 @@ class FakeSession:
         self.status_error = status_error
         self.calls = []
 
-    def post(self, url, json, timeout):
-        self.calls.append({"url": url, "json": json, "timeout": timeout})
+    def post(self, url, json, timeout, headers=None):
+        self.calls.append(
+            {"url": url, "json": json, "timeout": timeout, "headers": headers}
+        )
         return FakeResponse(self.payload, self.status_error)
 
 
@@ -70,6 +72,18 @@ class Crawl4AITests(unittest.TestCase):
         self.assertEqual(session.calls[0]["url"], "http://crawler:11235/md")
         self.assertEqual(session.calls[0]["json"]["f"], "raw")
         self.assertEqual(session.calls[0]["timeout"], 12.0)
+
+    def test_crawl4ai_scraper_sends_bearer_token_when_configured(self):
+        session = FakeSession({"markdown": "Raw markdown " * 20})
+
+        with patch.dict("os.environ", {"CRAWL4AI_API_TOKEN": "token-123"}):
+            scraper = Crawl4AIScraper("https://example.com", session)
+            scraper.scrape()
+
+        self.assertEqual(
+            session.calls[0]["headers"],
+            {"Authorization": "Bearer token-123"},
+        )
 
     def test_crawl4ai_scraper_extracts_title_from_markdown(self):
         session = FakeSession({"markdown": "# Markdown Title\n\n" + "Useful content " * 20})

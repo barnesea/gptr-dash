@@ -10,6 +10,7 @@ import sys
 import uuid
 import logging
 import asyncio
+import requests
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
@@ -85,6 +86,80 @@ def get_deep_research_semaphore() -> asyncio.Semaphore | None:
         logger.info("Limiting MCP deep_research concurrency to %s job(s)", limit)
 
     return _deep_research_semaphore
+
+
+def check_research_dependency_status() -> Dict[str, Any]:
+    """Check the external services used by MCP web research."""
+    retriever = os.getenv("RETRIEVER", "tavily")
+    scraper = os.getenv("SCRAPER", "bs")
+    searx_url = os.getenv("SEARX_URL") or os.getenv("SEARXNG_URL", "")
+    crawl4ai_url = os.getenv("CRAWL4AI_BASE_URL", "")
+
+    checks: Dict[str, Any] = {
+        "config": {
+            "retriever": retriever,
+            "scraper": scraper,
+            "searx_url": searx_url,
+            "crawl4ai_url": crawl4ai_url,
+            "crawl4ai_token_configured": bool(os.getenv("CRAWL4AI_API_TOKEN")),
+            "mcp_transport": os.getenv("MCP_TRANSPORT", "stdio"),
+            "mcp_path": os.getenv("MCP_PATH", "/mcp"),
+            "deep_research_concurrency": get_deep_research_limit(),
+        },
+        "searx": {"enabled": retriever in {"searx", "searxng"}},
+        "crawl4ai": {"enabled": scraper == "crawl4ai"},
+    }
+
+    if checks["searx"]["enabled"]:
+        try:
+            response = requests.get(
+                f"{searx_url.rstrip('/')}/search",
+                params={"q": "example domain", "format": "json"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            results = response.json().get("results", [])
+            checks["searx"].update(
+                {"ok": bool(results), "status_code": response.status_code, "result_count": len(results)}
+            )
+        except Exception as exc:
+            checks["searx"].update({"ok": False, "error": str(exc)})
+
+    if checks["crawl4ai"]["enabled"]:
+        try:
+            from gpt_researcher.scraper.crawl4ai.crawl4ai import Crawl4AIScraper
+
+            content, _images, title = Crawl4AIScraper("https://example.com").scrape()
+            checks["crawl4ai"].update(
+                {
+                    "ok": bool(content),
+                    "title": title,
+                    "content_length": len(content),
+                }
+            )
+        except Exception as exc:
+            checks["crawl4ai"].update({"ok": False, "error": str(exc)})
+
+    dependency_checks = [
+        check for name, check in checks.items()
+        if name != "config" and check.get("enabled")
+    ]
+    checks["ok"] = all(check.get("ok") for check in dependency_checks)
+    return checks
+
+
+@mcp.tool()
+async def check_research_dependencies() -> Dict[str, Any]:
+    """
+    Check the configured research dependency path used by deep_research.
+
+    This verifies SearXNG search and Crawl4AI scraping from inside the MCP server
+    process, which catches Docker DNS, auth, and service health issues before a
+    full research job returns empty context.
+    """
+    return create_success_response(
+        await asyncio.to_thread(check_research_dependency_status)
+    )
 
 
 @mcp.resource("research://{topic}")
@@ -325,6 +400,12 @@ def research_query(topic: str, goal: str, report_format: str = "research_report"
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     return JSONResponse({"status": "healthy", "service": "mcp-server"})
+
+
+@mcp.custom_route("/health/dependencies", methods=["GET"])
+async def dependency_health_check(request):
+    status = await asyncio.to_thread(check_research_dependency_status)
+    return JSONResponse(status, status_code=200 if status.get("ok") else 503)
 
 def run_server():
     """Run the MCP server using FastMCP's built-in event loop handling."""
