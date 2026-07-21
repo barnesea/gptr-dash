@@ -4,11 +4,11 @@
 FROM node:18.17.0-alpine AS deps
 WORKDIR /app
 
-# Copy only package manifest first for better layer caching
-COPY package.json ./
+# Copy package manifests first for better layer caching and deterministic installs
+COPY package*.json ./
 
-# Install dependencies (no lock file present – recommend adding one for reproducibility)
-RUN npm install --legacy-peer-deps
+# Install dependencies from the lockfile
+RUN npm ci --legacy-peer-deps
 
 ###############################################
 # 2) Builder layer – builds Next.js (.next)
