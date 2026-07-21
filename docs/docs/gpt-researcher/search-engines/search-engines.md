@@ -25,6 +25,7 @@ Thanks to our community, we have integrated the following web search engines:
 
 - [Tavily](https://app.tavily.com) - Default
 - [Bing](https://www.microsoft.com/en-us/bing/apis/bing-web-search-api) - Env: `RETRIEVER=bing`
+- [Brave Search](https://brave.com/search/api/) - Env: `RETRIEVER=brave` and `BRAVE_API_KEY`
 - [Google](https://developers.google.com/custom-search/v1/overview) - Env: `RETRIEVER=google`
 - [SearchApi](https://www.searchapi.io/) - Env: `RETRIEVER=searchapi`
 - [Serp API](https://serpapi.com/) - Env: `RETRIEVER=serpapi`
@@ -33,6 +34,7 @@ Thanks to our community, we have integrated the following web search engines:
 - [Duckduckgo](https://pypi.org/project/duckduckgo-search/) - Env: `RETRIEVER=duckduckgo`
 - [Arxiv](https://info.arxiv.org/help/api/index.html) - Env: `RETRIEVER=arxiv`
 - [Exa](https://docs.exa.ai/reference/getting-started) - Env: `RETRIEVER=exa`
+- [fastCRW](https://fastcrw.com/docs/rest-api) - Env: `RETRIEVER=crw`
 - [PubMedCentral](https://www.ncbi.nlm.nih.gov/home/develop/api/) - Env: `RETRIEVER=pubmed_central`
 
 ## Custom Retrievers
@@ -73,6 +75,18 @@ For the custom retriever to work correctly, the response from the endpoint shoul
 The system assumes this response format and processes the list of sources accordingly.
 
 ## Search Engine Configuration
+
+### Brave Search
+
+To use [Brave Search](https://brave.com/search/api/) as your search engine:
+
+1. Get your API key from [Brave Search API](https://brave.com/search/api/)
+2. Set the required environment variables:
+
+```bash
+RETRIEVER=brave
+BRAVE_API_KEY=your_api_key_here
+```
 
 ### Serper
 

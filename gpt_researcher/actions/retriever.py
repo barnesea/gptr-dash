@@ -22,15 +22,18 @@ def get_retriever(retriever: str):
         - serper: Serper API
         - duckduckgo: DuckDuckGo search
         - bing: Bing search
+        - brave: Brave Search API
         - arxiv: arXiv academic search
         - tavily: Tavily search API
         - exa: Exa search
+        - crw: fastCRW search (Firecrawl-compatible web scraper)
         - semantic_scholar: Semantic Scholar academic search
         - pubmed_central: PubMed Central medical literature
         - openalex: OpenAlex scholarly works catalog
         - custom: Custom user-defined retriever
         - mcp: Model Context Protocol retriever
         - xquik: Xquik X/Twitter search
+        - getxapi: GetXAPI X/Twitter search
     """
     match retriever:
         case "google":
@@ -61,6 +64,10 @@ def get_retriever(retriever: str):
             from gpt_researcher.retrievers import BingSearch
 
             return BingSearch
+        case "brave":
+            from gpt_researcher.retrievers import BraveSearch
+
+            return BraveSearch
         case "bocha":
             from gpt_researcher.retrievers import BoChaSearch
 
@@ -73,10 +80,18 @@ def get_retriever(retriever: str):
             from gpt_researcher.retrievers import TavilySearch
 
             return TavilySearch
+        case "groundroute":
+            from gpt_researcher.retrievers import GroundRouteSearch
+
+            return GroundRouteSearch
         case "exa":
             from gpt_researcher.retrievers import ExaSearch
 
             return ExaSearch
+        case "crw":
+            from gpt_researcher.retrievers import CRWRetriever
+
+            return CRWRetriever
         case "semantic_scholar":
             from gpt_researcher.retrievers import SemanticScholarSearch
 
@@ -101,6 +116,10 @@ def get_retriever(retriever: str):
             from gpt_researcher.retrievers import OpenAlexSearch
 
             return OpenAlexSearch
+        case "getxapi":
+            from gpt_researcher.retrievers import GetXAPISearch
+
+            return GetXAPISearch
 
         case _:
             return None
@@ -130,14 +149,17 @@ def get_retrievers(headers: dict[str, str], cfg):
             retrievers = cfg.retrievers.split(",")
         else:
             retrievers = cfg.retrievers
-        # Strip whitespace from each retriever name
-        retrievers = [r.strip() for r in retrievers]
     # If not found, check config for a single retriever
     elif cfg.retriever:
         retrievers = [cfg.retriever]
     # If still not set, use default retriever
     else:
         retrievers = [get_default_retriever().__name__]
+
+    # Strip whitespace from each retriever name so comma-separated lists with
+    # spaces (e.g. "tavily, exa" from a header or config) resolve correctly
+    # instead of silently falling back to the default retriever.
+    retrievers = [r.strip() for r in retrievers if r and r.strip()]
 
     # Convert retriever names to actual retriever classes
     # Use get_default_retriever() as a fallback for any invalid retriever names

@@ -3,9 +3,9 @@
 As described in the [introduction](/docs/gpt-researcher/gptr/config), the default LLM and embedding is OpenAI due to its superior performance and speed. 
 With that said, GPT Researcher supports various open/closed source LLMs and embeddings, and you can easily switch between them by updating the `SMART_LLM`, `FAST_LLM` and `EMBEDDING` env variables. You might also need to include the provider API key and corresponding configuration params.
 
-Current supported LLMs are `openai`, `anthropic`, `azure_openai`, `cohere`, `google_vertexai`, `google_genai`, `fireworks`, `ollama`, `together`, `mistralai`, `huggingface`, `groq`, `bedrock`, `litellm` and `minimax`.
+Current supported LLMs are `openai`, `anthropic`, `azure_openai`, `cohere`, `google_vertexai`, `google_genai`, `fireworks`, `ollama`, `together`, `mistralai`, `huggingface`, `groq`, `bedrock`, `litellm`, `minimax`, `atlascloud` and `nebius`.
 
-Current supported embeddings are `openai`, `azure_openai`, `cohere`, `google_vertexai`, `google_genai`, `fireworks`, `ollama`, `together`, `mistralai`, `huggingface`, `nomic` ,`voyageai` and `bedrock`.
+Current supported embeddings are `openai`, `azure_openai`, `cohere`, `google_vertexai`, `google_genai`, `fireworks`, `ollama`, `together`, `mistralai`, `huggingface`, `nomic` ,`voyageai`, `bedrock` and `nebius`.
 
 To learn more about support customization options see [here](/docs/gpt-researcher/gptr/config).
 
@@ -27,9 +27,9 @@ Below you can find examples for how to configure the various supported LLMs.
 OPENAI_API_KEY=[Your Key]
 
 # specify llms
-FAST_LLM=openai:gpt-5-mini
-SMART_LLM=openai:gpt-5
-STRATEGIC_LLM=openai:o4-mini
+FAST_LLM=openai:gpt-5.4-mini
+SMART_LLM=openai:gpt-5.4
+STRATEGIC_LLM=openai:gpt-5.4
 
 # specify embedding
 EMBEDDING=openai:text-embedding-3-small
@@ -387,24 +387,23 @@ EMBEDDING="aimlapi:text-embedding-3-small"
 
 ## MiniMax
 
-[MiniMax](https://www.minimaxi.com) offers powerful large language models with an OpenAI-compatible API. The latest MiniMax-M2.7 features improved reasoning and competitive pricing.
+[MiniMax](https://www.minimaxi.com) offers powerful large language models with an OpenAI-compatible API. The latest MiniMax-M3 features a 512K context window, up to 128K output, and image input support.
 
 Sign up at [minimaxi.com](https://www.minimaxi.com) to get an API key, then set the following environment variables:
 
 ```env
 MINIMAX_API_KEY=[Your Key]
-FAST_LLM=minimax:MiniMax-M2.7-highspeed
-SMART_LLM=minimax:MiniMax-M2.7
-STRATEGIC_LLM=minimax:MiniMax-M2.7
+FAST_LLM=minimax:MiniMax-M3
+SMART_LLM=minimax:MiniMax-M3
+STRATEGIC_LLM=minimax:MiniMax-M3
 
 EMBEDDING=minimax:embo-01
 ```
 
 Available models:
-- `MiniMax-M2.7` — latest flagship model with improved reasoning
-- `MiniMax-M2.7-highspeed` — optimized for speed
-- `MiniMax-M2.5` — 204K context, general-purpose model
-- `MiniMax-M2.5-highspeed` — 204K context, optimized for speed
+- `MiniMax-M3` — flagship model with 512K context, 128K max output, image input support (default)
+- `MiniMax-M2.7` — previous-generation model
+- `MiniMax-M2.7-highspeed` — previous-generation low-latency variant
 
 ## Avian
 
@@ -424,6 +423,36 @@ Available models:
 - `moonshotai/kimi-k2.5` — 131K context, $0.45/$2.20 per 1M tokens
 - `z-ai/glm-5` — 131K context, $0.30/$2.55 per 1M tokens
 - `minimax/minimax-m2.5` — 1M context, $0.30/$1.10 per 1M tokens
+
+## Atlas Cloud
+
+[Atlas Cloud](https://www.atlascloud.ai) provides an OpenAI-compatible API with access to 300+ models (including DeepSeek, Llama, Qwen, and more) at competitive prices.
+
+Sign up at [atlascloud.ai](https://www.atlascloud.ai) to get an API key, then set the following environment variables:
+
+```env
+ATLASCLOUD_API_KEY=[Your Key]
+FAST_LLM=atlascloud:deepseek-ai/DeepSeek-V3
+SMART_LLM=atlascloud:deepseek-ai/DeepSeek-R1
+STRATEGIC_LLM=atlascloud:deepseek-ai/DeepSeek-R1
+```
+
+## Nebius Token Factory
+
+[Nebius Token Factory](https://tokenfactory.nebius.com) serves 60+ open models (DeepSeek, Qwen, Llama, Kimi, and more) through an OpenAI-compatible API, and also hosts text-embedding models — so GPTR can run both its LLM and its embedding stack on a single provider.
+
+Sign up at [tokenfactory.nebius.com](https://tokenfactory.nebius.com) to get an API key, then set the following environment variables:
+
+```env
+NEBIUS_API_KEY=[Your Key]
+FAST_LLM=nebius:meta-llama/Llama-3.3-70B-Instruct
+SMART_LLM=nebius:Qwen/Qwen3-235B-A22B-Instruct-2507
+STRATEGIC_LLM=nebius:openai/gpt-oss-120b
+
+EMBEDDING=nebius:Qwen/Qwen3-Embedding-8B
+```
+
+Browse the full model catalog [_here_](https://tokenfactory.nebius.com/models). To point at a self-hosted or regional endpoint, set `NEBIUS_BASE_URL` (defaults to `https://api.tokenfactory.nebius.com/v1`).
 
 ## vLLM
 ```env

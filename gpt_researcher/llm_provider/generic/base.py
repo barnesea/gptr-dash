@@ -36,6 +36,8 @@ _SUPPORTED_PROVIDERS = {
     "forge",
     "avian",
     "minimax",
+    "atlascloud",
+    "nebius",
 }
 
 NO_SUPPORT_TEMPERATURE_MODELS = [
@@ -54,6 +56,22 @@ NO_SUPPORT_TEMPERATURE_MODELS = [
     # GPT-5 family: OpenAI enforces default temperature only
     "gpt-5",
     "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.4-pro",
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    # Claude 4.x family: Anthropic deprecates temperature on these models
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
 ]
 
 SUPPORT_REASONING_EFFORT_MODELS = [
@@ -63,6 +81,12 @@ SUPPORT_REASONING_EFFORT_MODELS = [
     "o3-2025-04-16",
     "o4-mini",
     "o4-mini-2025-04-16",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.4-pro",
+    "gpt-5.5",
+    "gpt-5.5-pro",
 ]
 
 class ReasoningEfforts(Enum):
@@ -127,6 +151,10 @@ class GenericLLMProvider:
             # Support custom OpenAI-compatible APIs via OPENAI_BASE_URL
             if "openai_api_base" not in kwargs and os.environ.get("OPENAI_BASE_URL"):
                 kwargs["openai_api_base"] = os.environ["OPENAI_BASE_URL"]
+
+            # Report token usage on streamed responses too, so cost
+            # tracking can use real usage instead of tiktoken estimates.
+            kwargs.setdefault("stream_usage", True)
 
             llm = ChatOpenAI(**kwargs)
         elif provider == "anthropic":
@@ -225,6 +253,14 @@ class GenericLLMProvider:
                      openai_api_key=os.environ["DEEPSEEK_API_KEY"],
                      **kwargs
                 )
+        elif provider == "atlascloud":
+            _check_pkg("langchain_openai")
+            from langchain_openai import ChatOpenAI
+
+            llm = ChatOpenAI(openai_api_base='https://api.atlascloud.ai/v1',
+                     openai_api_key=os.environ["ATLASCLOUD_API_KEY"],
+                     **kwargs
+                )
         elif provider == "litellm":
             _check_pkg("langchain_community")
             from langchain_community.chat_models.litellm import ChatLiteLLM
@@ -293,6 +329,15 @@ class GenericLLMProvider:
 
             llm = ChatOpenAI(openai_api_base='https://api.minimax.io/v1',
                      openai_api_key=os.environ["MINIMAX_API_KEY"],
+                     **kwargs
+                )
+        elif provider == "nebius":
+            _check_pkg("langchain_openai")
+            from langchain_openai import ChatOpenAI
+
+            # NEBIUS_BASE_URL overrides the default endpoint (self-hosted / regional)
+            llm = ChatOpenAI(openai_api_base=os.getenv("NEBIUS_BASE_URL", 'https://api.tokenfactory.nebius.com/v1'),
+                     openai_api_key=os.environ["NEBIUS_API_KEY"],
                      **kwargs
                 )
         elif provider == 'netmind':

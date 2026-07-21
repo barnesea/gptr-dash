@@ -100,6 +100,7 @@ class ContextCompressor:
         documents,
         embeddings,
         max_results: int = 5,
+        similarity_threshold: float | None = None,
         prompt_family: type[PromptFamily] | PromptFamily = PromptFamily,
         **kwargs,
     ):
@@ -109,6 +110,8 @@ class ContextCompressor:
             documents: List of documents to compress.
             embeddings: Embedding model instance.
             max_results: Maximum number of results to return.
+            similarity_threshold: Minimum similarity score for inclusion.
+                Falls back to the SIMILARITY_THRESHOLD env var when not given.
             prompt_family: Prompt family for formatting output.
             **kwargs: Additional keyword arguments.
         """
@@ -116,7 +119,9 @@ class ContextCompressor:
         self.documents = documents
         self.kwargs = kwargs
         self.embeddings = embeddings
-        self.similarity_threshold = os.environ.get("SIMILARITY_THRESHOLD", 0.35)
+        if similarity_threshold is None:
+            similarity_threshold = float(os.environ.get("SIMILARITY_THRESHOLD", 0.35))
+        self.similarity_threshold = similarity_threshold
         self.prompt_family = prompt_family
 
     def __get_contextual_retriever(self):
@@ -161,10 +166,15 @@ class ContextCompressor:
         # If total content is small, skip expensive compression and return directly
         if total_chars < chunk_threshold and len(self.documents) <= max_results:
             # Fast path: no compression needed
+            # Map scraper/retriever dict keys into metadata that pretty_print_docs expects.
+            # Raw dicts use `url`; SearchAPIRetriever / pretty_print use `source`.
             direct_docs = [
                 Document(
-                    page_content=doc.get('raw_content', ''),
-                    metadata=doc
+                    page_content=doc.get('raw_content', '') or '',
+                    metadata={
+                        "title": doc.get("title", "") or "",
+                        "source": doc.get("source") or doc.get("url") or "",
+                    },
                 )
                 for doc in self.documents[:max_results]
             ]

@@ -217,10 +217,14 @@ def trim_context_to_word_limit(context_list: List[str], max_words: int = MAX_CON
 
     # Process in reverse to keep most recent items
     for item in reversed(context_list):
+        text = " ".join(str(part) for part in item) if isinstance(item, list) else str(item)
         words = count_words(item)
         if total_words + words <= max_words:
             trimmed_context.insert(0, item)  # Insert at start to maintain original order
             total_words += words
+        elif not trimmed_context:
+            trimmed_context.insert(0, " ".join(text.split()[:max_words]))
+            break
         else:
             break
 
@@ -364,7 +368,8 @@ Return ONLY a JSON object using this exact schema:
             model=self.researcher.cfg.strategic_llm_model,
             temperature=0.4,
             reasoning_effort=ReasoningEfforts.High.value,
-            max_tokens=1000
+            # Needs headroom for reasoning tokens on reasoning models
+            max_tokens=4000
         )
 
         return parse_research_results_response(response, num_learnings)
@@ -398,6 +403,15 @@ Return ONLY a JSON object using this exact schema:
         serp_queries = await self.generate_search_queries(query, num_queries=breadth)
         print(f"✅ Generated {len(serp_queries)} queries: {[q['query'] for q in serp_queries]}", flush=True)
         progress.total_queries = len(serp_queries)
+        if not serp_queries:
+            logger.warning("Deep research generated zero search queries; stopping descent.")
+            return {
+                'learnings': all_learnings,
+                'visited_urls': all_visited_urls,
+                'citations': all_citations,
+                'context': all_context,
+                'sources': all_sources,
+            }
 
         all_learnings = learnings.copy()
         all_citations = citations.copy()
@@ -476,13 +490,40 @@ Return ONLY a JSON object using this exact schema:
         if on_progress:
             on_progress(progress)
 
+        # #1579: if every branch at this level failed (bad API key, offline
+        # retriever, etc.), stop instead of endlessly generating follow-ups
+        # from empty goals / empty learnings.
+        if not results:
+            logger.warning(
+                "Deep research produced no successful query results at depth=%s; stopping descent.",
+                depth,
+            )
+            print(
+                f"\nDEEP RESEARCH: no successful results at depth={depth}; stopping to avoid infinite work.",
+                flush=True,
+            )
+            return {
+                'learnings': all_learnings,
+                'visited_urls': all_visited_urls,
+                'citations': all_citations,
+                'context': all_context,
+                'sources': all_sources,
+            }
+
         # Collect all results
         for result in results:
             all_learnings.extend(result['learnings'])
             all_visited_urls.update(result['visited_urls'])
             all_citations.update(result['citations'])
             if result['context']:
-                all_context.append(result['context'])
+                # Use extend, not append: when CURATE_SOURCES=True, result['context'] is
+                # a List[dict]. append() nests it as a single item, which causes
+                # "\n".join() to crash later with "expected str instance, dict found".
+                ctx = result['context']
+                if isinstance(ctx, list):
+                    all_context.extend(ctx)
+                else:
+                    all_context.append(ctx)
             if result['sources']:
                 all_sources.extend(result['sources'])
 
@@ -583,7 +624,12 @@ Return ONLY a JSON object using this exact schema:
         final_context = trim_context_to_word_limit(context_with_citations)
         
         # Set enhanced context and visited URLs
-        self.researcher.context = "\n".join(final_context)
+        self.researcher.context = "\n".join(
+            item if isinstance(item, str)
+            else item.get("Content", str(item)) if isinstance(item, dict)
+            else str(item)
+            for item in final_context
+        )
         self.researcher.visited_urls = results['visited_urls']
 
         # Set research sources

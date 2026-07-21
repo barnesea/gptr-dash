@@ -20,7 +20,11 @@ class SemanticScholarSearch:
         """
         self.query = query
         assert sort in self.VALID_SORT_CRITERIA, "Invalid sort criterion"
-        self.sort = sort.lower()
+        # Preserve the exact (camelCase) criterion. The Semantic Scholar API
+        # expects ``citationCount`` / ``publicationDate`` verbatim; lowercasing
+        # them produced ``citationcount`` / ``publicationdate``, which the API
+        # rejects or silently ignores.
+        self.sort = sort
 
     def search(self, max_results: int = 20) -> List[Dict[str, str]]:
         """
@@ -43,17 +47,29 @@ class SemanticScholarSearch:
             print(f"An error occurred while accessing Semantic Scholar API: {e}")
             return []
 
-        results = response.json().get("data", [])
-        search_result = []
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return []
+        results = payload.get("data") or []
+        if not isinstance(results, list):
+            return []
 
+        search_result = []
         for result in results:
-            if result.get("isOpenAccess") and result.get("openAccessPdf"):
-                search_result.append(
-                    {
-                        "title": result.get("title", "No Title"),
-                        "href": result["openAccessPdf"].get("url", "No URL"),
-                        "body": result.get("abstract", "Abstract not available"),
-                    }
-                )
+            if not isinstance(result, dict):
+                continue
+            pdf = result.get("openAccessPdf")
+            if not (result.get("isOpenAccess") and isinstance(pdf, dict)):
+                continue
+            href = pdf.get("url") or ""
+            if not href:
+                continue
+            search_result.append(
+                {
+                    "title": result.get("title") or "No Title",
+                    "href": href,
+                    "body": result.get("abstract") or "Abstract not available",
+                }
+            )
 
         return search_result

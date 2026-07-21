@@ -6,9 +6,13 @@ using the Tavily API.
 
 import json
 import os
+import re
 from typing import Literal, Optional, Sequence
 
 import requests
+
+# Google-style site:domain operators, which the Tavily API does not support.
+_SITE_OPERATOR_PATTERN = re.compile(r"site:(\S+)", re.IGNORECASE)
 
 
 class TavilySearch:
@@ -104,21 +108,40 @@ class TavilySearch:
 
         """
         try:
-            # Search the query
+            # LLM-generated queries often use Google-style site: operators,
+            # which Tavily rejects (returning zero results). Translate them
+            # into Tavily's include_domains parameter instead.
+            query = self.query
+            include_domains = self.query_domains
+            site_domains = _SITE_OPERATOR_PATTERN.findall(query)
+            if site_domains:
+                query = _SITE_OPERATOR_PATTERN.sub("", query).strip()
+                # Keep only the domain part (Tavily matches domains, not paths)
+                site_domains = [d.strip(",").split("/")[0] for d in site_domains]
+                include_domains = list(dict.fromkeys(site_domains + (include_domains or [])))
+
+            # Search the query (Tavily rejects queries longer than 400 chars)
             results = self._search(
-                self.query,
+                query[:400],
                 search_depth="basic",
                 max_results=max_results,
                 topic=self.topic,
-                include_domains=self.query_domains,
+                include_domains=include_domains,
             )
             sources = results.get("results", [])
             if not sources:
                 raise Exception("No results found with Tavily API search.")
-            # Return the results
-            search_response = [
-                {"href": obj["url"], "body": obj["content"]} for obj in sources
-            ]
+            # Return the results. Guard each source against missing/None
+            # fields so a single malformed hit does not drop the whole page.
+            search_response = []
+            for obj in sources:
+                if not isinstance(obj, dict):
+                    continue
+                href = obj.get("url")
+                if not href:
+                    continue
+                body = obj.get("content") or obj.get("snippet") or ""
+                search_response.append({"href": href, "body": body})
         except Exception as e:
             print(f"Error: {e}. Failed fetching sources. Resulting in empty response.")
             search_response = []
