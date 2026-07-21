@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gpt_researcher import GPTResearcher
+from gpt_researcher.utils.enum import ReportType
 
 # Load environment variables
 load_dotenv()
@@ -88,6 +89,16 @@ def get_deep_research_semaphore() -> asyncio.Semaphore | None:
     return _deep_research_semaphore
 
 
+def recursive_deep_research_enabled() -> bool:
+    """Return whether MCP deep_research should use GPT Researcher's recursive mode."""
+    return os.getenv("MCP_ENABLE_RECURSIVE_DEEP_RESEARCH", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def check_research_dependency_status() -> Dict[str, Any]:
     """Check the external services used by MCP web research."""
     retriever = os.getenv("RETRIEVER", "tavily")
@@ -104,7 +115,11 @@ def check_research_dependency_status() -> Dict[str, Any]:
             "crawl4ai_token_configured": bool(os.getenv("CRAWL4AI_API_TOKEN")),
             "mcp_transport": os.getenv("MCP_TRANSPORT", "stdio"),
             "mcp_path": os.getenv("MCP_PATH", "/mcp"),
-            "deep_research_concurrency": get_deep_research_limit(),
+            "recursive_deep_research_enabled": recursive_deep_research_enabled(),
+            "mcp_max_concurrent_deep_research": get_deep_research_limit(),
+            "recursive_deep_research_breadth": os.getenv("DEEP_RESEARCH_BREADTH", ""),
+            "recursive_deep_research_depth": os.getenv("DEEP_RESEARCH_DEPTH", ""),
+            "recursive_deep_research_concurrency": os.getenv("DEEP_RESEARCH_CONCURRENCY", ""),
         },
         "searx": {"enabled": retriever in {"searx", "searxng"}},
         "crawl4ai": {"enabled": scraper == "crawl4ai"},
@@ -235,8 +250,14 @@ async def _run_deep_research(query: str) -> Dict[str, Any]:
     # Generate a unique ID for this research session
     research_id = str(uuid.uuid4())
     
+    report_type = (
+        ReportType.DeepResearch.value
+        if recursive_deep_research_enabled()
+        else ReportType.ResearchReport.value
+    )
+
     # Initialize GPT Researcher
-    researcher = GPTResearcher(query)
+    researcher = GPTResearcher(query, report_type=report_type)
     
     # Start research
     try:
@@ -255,6 +276,8 @@ async def _run_deep_research(query: str) -> Dict[str, Any]:
         return create_success_response({
             "research_id": research_id,
             "query": query,
+            "report_type": report_type,
+            "recursive_deep_research_enabled": recursive_deep_research_enabled(),
             "source_count": len(sources),
             "context": context,
             "sources": format_sources_for_response(sources),

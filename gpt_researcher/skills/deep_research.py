@@ -398,6 +398,12 @@ Return ONLY a JSON object using this exact schema:
         if on_progress:
             on_progress(progress)
 
+        all_learnings = learnings.copy()
+        all_citations = citations.copy()
+        all_visited_urls = visited_urls.copy()
+        all_context = []
+        all_sources = []
+
         # Generate search queries
         print(f"🔎 Generating {breadth} search queries...", flush=True)
         serp_queries = await self.generate_search_queries(query, num_queries=breadth)
@@ -412,12 +418,6 @@ Return ONLY a JSON object using this exact schema:
                 'context': all_context,
                 'sources': all_sources,
             }
-
-        all_learnings = learnings.copy()
-        all_citations = citations.copy()
-        all_visited_urls = visited_urls.copy()
-        all_context = []
-        all_sources = []
 
         # Process queries with concurrency limit
         semaphore = asyncio.Semaphore(self.concurrency_limit)

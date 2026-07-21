@@ -29,6 +29,7 @@ TAVILY_API_KEY=your_tavily_key
 MCP_TRANSPORT=sse
 MCP_PORT=8001
 MCP_MAX_CONCURRENT_DEEP_RESEARCH=1
+MCP_ENABLE_RECURSIVE_DEEP_RESEARCH=true
 # Optional for Streamable HTTP clients such as Open WebUI:
 # MCP_TRANSPORT=streamable-http
 # MCP_PATH=/mcp
@@ -37,6 +38,10 @@ MCP_MAX_CONCURRENT_DEEP_RESEARCH=1
 Set `MCP_MAX_CONCURRENT_DEEP_RESEARCH=0` to disable the limit. The limit applies
 only to the expensive `deep_research` tool; lighter MCP tools and health checks
 continue to run while deep research calls wait for a slot.
+
+Set `MCP_ENABLE_RECURSIVE_DEEP_RESEARCH=false` to make the MCP `deep_research`
+tool use the lighter standard research workflow instead of GPT Researcher's
+recursive deep research mode.
 
 Optional GPT Researcher settings such as `OPENAI_BASE_URL`,
 `LANGCHAIN_API_KEY`, retriever settings, and model configuration are inherited
