@@ -295,8 +295,11 @@ class Config:
         """Parse the retriever string into a list of retrievers and validate them."""
         from ..retrievers.utils import get_all_retriever_names
         
-        retrievers = [retriever.strip()
-                      for retriever in retriever_str.split(",")]
+        retriever_aliases = {"searxng": "searx"}
+        retrievers = [
+            retriever_aliases.get(retriever.strip(), retriever.strip())
+            for retriever in retriever_str.split(",")
+        ]
         valid_retrievers = get_all_retriever_names() or []
         invalid_retrievers = [r for r in retrievers if r not in valid_retrievers]
         if invalid_retrievers:

@@ -11,6 +11,7 @@ behavior for the header path (and for a single-retriever value).
 import unittest
 from types import SimpleNamespace
 
+from gpt_researcher.config.config import Config
 from gpt_researcher.actions.retriever import (
     get_retrievers,
     get_retriever,
@@ -55,6 +56,15 @@ class GetRetrieversWhitespaceTests(unittest.TestCase):
     def test_config_string_path_still_strips(self):
         result = get_retrievers({}, _cfg(retrievers="tavily, exa"))
         self.assertEqual(result, [get_retriever("tavily"), get_retriever("exa")])
+
+    def test_searxng_alias_resolves_to_searx(self):
+        self.assertEqual(get_retriever("searxng"), get_retriever("searx"))
+        result = get_retrievers({}, _cfg(retrievers="searxng"))
+        self.assertEqual(result, [get_retriever("searx")])
+
+    def test_config_parser_normalizes_searxng_alias(self):
+        cfg = Config.__new__(Config)
+        self.assertEqual(cfg.parse_retrievers("searxng"), ["searx"])
 
 
 if __name__ == "__main__":

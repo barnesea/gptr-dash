@@ -35,6 +35,8 @@ def get_retriever(retriever: str):
         - xquik: Xquik X/Twitter search
         - getxapi: GetXAPI X/Twitter search
     """
+    retriever = {"searxng": "searx"}.get(retriever, retriever)
+
     match retriever:
         case "google":
             from gpt_researcher.retrievers import GoogleSearch
