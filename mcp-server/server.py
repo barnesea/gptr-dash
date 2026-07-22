@@ -14,9 +14,11 @@ import requests
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+from urllib.parse import quote
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
 from fastmcp import Context, FastMCP
+from fastmcp.server.dependencies import get_http_request
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -74,7 +76,10 @@ async def _mcp_progress(
     progress: int,
     total: int,
     message: str | None = None,
+    done: bool = False,
 ) -> None:
+    await _openwebui_status(ctx, message or "Working", done, progress, total)
+
     if ctx is None:
         return
     try:
@@ -85,6 +90,107 @@ async def _mcp_progress(
         )
     except Exception as exc:
         logger.debug("Failed to send MCP progress notification: %s", exc)
+
+
+def _openwebui_events_enabled() -> bool:
+    return os.getenv("OPENWEBUI_EVENTS_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _get_openwebui_request_headers() -> dict[str, str]:
+    try:
+        request = get_http_request()
+    except Exception:
+        return {}
+
+    return dict(request.headers) if getattr(request, "headers", None) else {}
+
+
+def _get_openwebui_event_context() -> dict[str, str]:
+    headers = _get_openwebui_request_headers()
+    chat_header = os.getenv("OPENWEBUI_CHAT_ID_HEADER", "X-OpenWebUI-Chat-Id").lower()
+    message_header = os.getenv("OPENWEBUI_MESSAGE_ID_HEADER", "X-OpenWebUI-Message-Id").lower()
+
+    chat_id = headers.get(chat_header, "").strip()
+    message_id = headers.get(message_header, "").strip()
+    if not chat_id or not message_id:
+        return {}
+
+    token = (
+        os.getenv("OPENWEBUI_EVENT_API_KEY", "").strip()
+        or os.getenv("OPENWEBUI_API_KEY", "").strip()
+    )
+    authorization = f"Bearer {token}" if token else headers.get("authorization", "").strip()
+    if not authorization:
+        return {}
+
+    base_url = (
+        os.getenv("OPENWEBUI_BASE_URL", "").strip()
+        or os.getenv("OPENWEBUI_URL", "").strip()
+        or "http://open-webui:9090"
+    )
+
+    return {
+        "authorization": authorization,
+        "base_url": base_url.rstrip("/"),
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+
+
+async def _openwebui_event(ctx: Context | None, event_type: str, data: dict[str, Any]) -> None:
+    if not _openwebui_events_enabled():
+        return
+
+    event_context = _get_openwebui_event_context()
+    if not event_context:
+        return
+
+    chat_id = quote(event_context["chat_id"], safe="")
+    message_id = quote(event_context["message_id"], safe="")
+    url = (
+        f"{event_context['base_url']}/api/v1/chats/"
+        f"{chat_id}/messages/{message_id}/event"
+    )
+    timeout = float(os.getenv("OPENWEBUI_EVENT_TIMEOUT_S", "5"))
+
+    def post_event() -> None:
+        response = requests.post(
+            url,
+            headers={"Authorization": event_context["authorization"]},
+            json={"type": event_type, "data": data},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+
+    try:
+        await asyncio.to_thread(post_event)
+    except Exception as exc:
+        logger.debug("Failed to emit OpenWebUI %s event: %s", event_type, exc)
+
+
+async def _openwebui_status(
+    ctx: Context | None,
+    description: str,
+    done: bool = False,
+    progress: int | None = None,
+    total: int | None = None,
+) -> None:
+    data: dict[str, Any] = {
+        "action": "gptr_deep_research",
+        "description": description,
+        "done": done,
+    }
+    if progress is not None:
+        data["progress"] = max(0, progress)
+    if total is not None:
+        data["total"] = max(1, total)
+
+    await _openwebui_event(ctx, "status", data)
 
 
 def _format_deep_research_progress(progress: Any) -> tuple[int, int, str]:
@@ -377,6 +483,7 @@ async def deep_research(query: str, ctx: Context) -> Dict[str, Any]:
     if refusal is not None:
         logger.info("Rejecting deep_research call for query %r: %s", query, refusal["message"])
         await _mcp_info(ctx, refusal["message"])
+        await _openwebui_status(ctx, refusal["message"], done=True)
         return refusal
 
     try:
@@ -409,7 +516,7 @@ async def _run_deep_research(query: str, ctx: Context | None = None) -> Dict[str
         await _drain_progress_tasks(on_progress)
         mcp.researchers[research_id] = researcher
         logger.info(f"Research completed for ID: {research_id}")
-        await _mcp_progress(ctx, 1, 1, "Deep research completed")
+        await _mcp_progress(ctx, 1, 1, "Deep research completed", done=True)
         await _mcp_info(ctx, f"Deep research completed: {research_id}")
         
         # Get the research context and sources
@@ -433,6 +540,7 @@ async def _run_deep_research(query: str, ctx: Context | None = None) -> Dict[str
     except Exception as e:
         await _drain_progress_tasks(on_progress)
         await _mcp_info(ctx, f"Deep research failed: {e}")
+        await _openwebui_status(ctx, f"Deep research failed: {e}", done=True)
         return handle_exception(e, "Research")
 
 
