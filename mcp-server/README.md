@@ -29,15 +29,20 @@ TAVILY_API_KEY=your_tavily_key
 MCP_TRANSPORT=sse
 MCP_PORT=8001
 MCP_MAX_CONCURRENT_DEEP_RESEARCH=1
+MCP_DEEP_RESEARCH_COOLDOWN_SECONDS=300
 MCP_ENABLE_RECURSIVE_DEEP_RESEARCH=true
 # Optional for Streamable HTTP clients such as Open WebUI:
 # MCP_TRANSPORT=streamable-http
 # MCP_PATH=/mcp
 ```
 
-Set `MCP_MAX_CONCURRENT_DEEP_RESEARCH=0` to disable the limit. The limit applies
-only to the expensive `deep_research` tool; lighter MCP tools and health checks
-continue to run while deep research calls wait for a slot.
+Set `MCP_DEEP_RESEARCH_COOLDOWN_SECONDS=0` to disable the cooldown. By default,
+the MCP server accepts one `deep_research` call every 300 seconds and immediately
+returns `status: rate_limited` for extra calls instead of queueing them.
+
+Set `MCP_MAX_CONCURRENT_DEEP_RESEARCH=0` to disable the active-job limit. When
+enabled, extra `deep_research` calls are rejected with `status: busy`; lighter
+MCP tools and health checks continue to run.
 
 Set `MCP_ENABLE_RECURSIVE_DEEP_RESEARCH=false` to make the MCP `deep_research`
 tool use the lighter standard research workflow instead of GPT Researcher's

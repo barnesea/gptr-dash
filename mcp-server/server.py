@@ -11,6 +11,7 @@ import uuid
 import logging
 import asyncio
 import requests
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
@@ -54,12 +55,13 @@ mcp = FastMCP(
 if not hasattr(mcp, "researchers"):
     mcp.researchers = {}
 
-_deep_research_semaphore: asyncio.Semaphore | None = None
-_deep_research_semaphore_limit: int | None = None
+_deep_research_admission_lock = asyncio.Lock()
+_deep_research_active_jobs = 0
+_deep_research_last_started_at: float | None = None
 
 
 def get_deep_research_limit() -> int:
-    """Return max concurrent deep_research jobs. Zero disables the limit."""
+    """Return max concurrent deep_research jobs. Zero disables the active limit."""
     raw_limit = os.getenv("MCP_MAX_CONCURRENT_DEEP_RESEARCH", "1").strip()
     try:
         limit = int(raw_limit)
@@ -73,20 +75,73 @@ def get_deep_research_limit() -> int:
     return max(limit, 0)
 
 
-def get_deep_research_semaphore() -> asyncio.Semaphore | None:
-    """Create or return the process-local deep research semaphore."""
-    global _deep_research_semaphore, _deep_research_semaphore_limit
+def get_deep_research_cooldown_seconds() -> int:
+    """Return the global cooldown between accepted deep_research calls."""
+    raw_cooldown = os.getenv("MCP_DEEP_RESEARCH_COOLDOWN_SECONDS", "300").strip()
+    try:
+        cooldown = int(raw_cooldown)
+    except ValueError:
+        logger.warning(
+            "Invalid MCP_DEEP_RESEARCH_COOLDOWN_SECONDS=%r, defaulting to 300",
+            raw_cooldown,
+        )
+        return 300
 
-    limit = get_deep_research_limit()
-    if limit == 0:
+    return max(cooldown, 0)
+
+
+def _deep_research_rate_limited_response(wait_seconds: int) -> Dict[str, Any]:
+    return {
+        "status": "rate_limited",
+        "message": (
+            "The deep_research tool has been called too frequently. "
+            f"Please wait {wait_seconds} seconds before calling it again."
+        ),
+        "retry_after_seconds": wait_seconds,
+    }
+
+
+def _deep_research_busy_response(active_jobs: int, limit: int) -> Dict[str, Any]:
+    return {
+        "status": "busy",
+        "message": (
+            "A deep_research job is already running. Do not call this tool again "
+            "until the current job finishes or the cooldown has expired."
+        ),
+        "active_jobs": active_jobs,
+        "max_concurrent_jobs": limit,
+    }
+
+
+async def admit_deep_research_call() -> Dict[str, Any] | None:
+    """Admit a deep_research call or return a refusal response without queueing."""
+    global _deep_research_active_jobs, _deep_research_last_started_at
+
+    async with _deep_research_admission_lock:
+        now = time.monotonic()
+        cooldown = get_deep_research_cooldown_seconds()
+        if cooldown and _deep_research_last_started_at is not None:
+            elapsed = now - _deep_research_last_started_at
+            if elapsed < cooldown:
+                return _deep_research_rate_limited_response(
+                    max(1, int(cooldown - elapsed))
+                )
+
+        limit = get_deep_research_limit()
+        if limit and _deep_research_active_jobs >= limit:
+            return _deep_research_busy_response(_deep_research_active_jobs, limit)
+
+        _deep_research_active_jobs += 1
+        _deep_research_last_started_at = now
         return None
 
-    if _deep_research_semaphore is None or _deep_research_semaphore_limit != limit:
-        _deep_research_semaphore = asyncio.Semaphore(limit)
-        _deep_research_semaphore_limit = limit
-        logger.info("Limiting MCP deep_research concurrency to %s job(s)", limit)
 
-    return _deep_research_semaphore
+async def release_deep_research_call() -> None:
+    """Release an admitted deep_research call."""
+    global _deep_research_active_jobs
+
+    async with _deep_research_admission_lock:
+        _deep_research_active_jobs = max(0, _deep_research_active_jobs - 1)
 
 
 def recursive_deep_research_enabled() -> bool:
@@ -117,6 +172,8 @@ def check_research_dependency_status() -> Dict[str, Any]:
             "mcp_path": os.getenv("MCP_PATH", "/mcp"),
             "recursive_deep_research_enabled": recursive_deep_research_enabled(),
             "mcp_max_concurrent_deep_research": get_deep_research_limit(),
+            "mcp_deep_research_active_jobs": _deep_research_active_jobs,
+            "mcp_deep_research_cooldown_seconds": get_deep_research_cooldown_seconds(),
             "recursive_deep_research_breadth": os.getenv("DEEP_RESEARCH_BREADTH", ""),
             "recursive_deep_research_depth": os.getenv("DEEP_RESEARCH_DEPTH", ""),
             "recursive_deep_research_concurrency": os.getenv("DEEP_RESEARCH_CONCURRENCY", ""),
@@ -234,13 +291,15 @@ async def deep_research(query: str) -> Dict[str, Any]:
         Dict containing research status, ID, and the actual research context and sources
         that can be used directly by LLMs for context enrichment
     """
-    semaphore = get_deep_research_semaphore()
-    if semaphore is not None:
-        logger.info("Waiting for deep_research concurrency slot for query: %s", query)
-        async with semaphore:
-            return await _run_deep_research(query)
+    refusal = await admit_deep_research_call()
+    if refusal is not None:
+        logger.info("Rejecting deep_research call for query %r: %s", query, refusal["message"])
+        return refusal
 
-    return await _run_deep_research(query)
+    try:
+        return await _run_deep_research(query)
+    finally:
+        await release_deep_research_call()
 
 
 async def _run_deep_research(query: str) -> Dict[str, Any]:
