@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -58,6 +58,85 @@ if not hasattr(mcp, "researchers"):
 _deep_research_admission_lock = asyncio.Lock()
 _deep_research_active_jobs = 0
 _deep_research_last_started_at: float | None = None
+
+
+async def _mcp_info(ctx: Context | None, message: str) -> None:
+    if ctx is None:
+        return
+    try:
+        await ctx.info(message)
+    except Exception as exc:
+        logger.debug("Failed to send MCP info notification: %s", exc)
+
+
+async def _mcp_progress(
+    ctx: Context | None,
+    progress: int,
+    total: int,
+    message: str | None = None,
+) -> None:
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(
+            progress=max(0, progress),
+            total=max(1, total),
+            message=message,
+        )
+    except Exception as exc:
+        logger.debug("Failed to send MCP progress notification: %s", exc)
+
+
+def _format_deep_research_progress(progress: Any) -> tuple[int, int, str]:
+    total_breadth = max(
+        1,
+        int(getattr(progress, "total_queries", 0) or 0),
+        int(getattr(progress, "total_breadth", 0) or 0),
+    )
+    total_depth = max(1, int(getattr(progress, "total_depth", 1) or 1))
+    current_depth = min(
+        total_depth,
+        max(1, int(getattr(progress, "current_depth", 1) or 1)),
+    )
+    completed_queries = max(0, int(getattr(progress, "completed_queries", 0) or 0))
+
+    total = total_depth * total_breadth
+    current = min(total, ((current_depth - 1) * total_breadth) + completed_queries)
+
+    current_query = getattr(progress, "current_query", None)
+    message = (
+        f"Deep research depth {current_depth}/{total_depth}, "
+        f"queries {min(completed_queries, total_breadth)}/{total_breadth}"
+    )
+    if current_query:
+        message = f"{message}: {str(current_query)[:180]}"
+
+    return current, total, message
+
+
+def _build_deep_research_progress_callback(ctx: Context | None):
+    if ctx is None:
+        return None
+
+    seen: set[tuple[int, int, str]] = set()
+    tasks: list[asyncio.Task] = []
+
+    def on_progress(progress: Any) -> None:
+        current, total, message = _format_deep_research_progress(progress)
+        signature = (current, total, message)
+        if signature in seen:
+            return
+        seen.add(signature)
+        tasks.append(asyncio.create_task(_mcp_progress(ctx, current, total, message)))
+
+    on_progress.tasks = tasks
+    return on_progress
+
+
+async def _drain_progress_tasks(on_progress) -> None:
+    tasks = getattr(on_progress, "tasks", None)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def get_deep_research_limit() -> int:
@@ -279,7 +358,7 @@ async def research_resource(topic: str) -> str:
 
 
 @mcp.tool()
-async def deep_research(query: str) -> Dict[str, Any]:
+async def deep_research(query: str, ctx: Context) -> Dict[str, Any]:
     """
     Conduct a web deep research on a given query using GPT Researcher. 
     Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
@@ -291,20 +370,25 @@ async def deep_research(query: str) -> Dict[str, Any]:
         Dict containing research status, ID, and the actual research context and sources
         that can be used directly by LLMs for context enrichment
     """
+    await _mcp_info(ctx, f"Starting deep research: {query}")
+    await _mcp_progress(ctx, 0, 1, "Deep research queued")
+
     refusal = await admit_deep_research_call()
     if refusal is not None:
         logger.info("Rejecting deep_research call for query %r: %s", query, refusal["message"])
+        await _mcp_info(ctx, refusal["message"])
         return refusal
 
     try:
-        return await _run_deep_research(query)
+        return await _run_deep_research(query, ctx)
     finally:
         await release_deep_research_call()
 
 
-async def _run_deep_research(query: str) -> Dict[str, Any]:
+async def _run_deep_research(query: str, ctx: Context | None = None) -> Dict[str, Any]:
     """Run a deep research job after concurrency admission."""
     logger.info(f"Conducting research on query: {query}...")
+    await _mcp_progress(ctx, 0, 1, "Deep research started")
     
     # Generate a unique ID for this research session
     research_id = str(uuid.uuid4())
@@ -317,12 +401,16 @@ async def _run_deep_research(query: str) -> Dict[str, Any]:
 
     # Initialize GPT Researcher
     researcher = GPTResearcher(query, report_type=report_type)
+    on_progress = _build_deep_research_progress_callback(ctx)
     
     # Start research
     try:
-        await researcher.conduct_research()
+        await researcher.conduct_research(on_progress=on_progress)
+        await _drain_progress_tasks(on_progress)
         mcp.researchers[research_id] = researcher
         logger.info(f"Research completed for ID: {research_id}")
+        await _mcp_progress(ctx, 1, 1, "Deep research completed")
+        await _mcp_info(ctx, f"Deep research completed: {research_id}")
         
         # Get the research context and sources
         context = researcher.get_research_context()
@@ -343,6 +431,8 @@ async def _run_deep_research(query: str) -> Dict[str, Any]:
             "source_urls": source_urls
         })
     except Exception as e:
+        await _drain_progress_tasks(on_progress)
+        await _mcp_info(ctx, f"Deep research failed: {e}")
         return handle_exception(e, "Research")
 
 

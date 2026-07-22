@@ -24,6 +24,14 @@ from .costs import calculate_llm_cost
 from .validators import Subtopics
 
 
+def _is_non_retryable_llm_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    non_retryable_statuses = ("400", "401", "403", "404", "405", "422")
+    if any(status in message for status in non_retryable_statuses):
+        return "429" not in message
+    return False
+
+
 def get_llm(llm_provider: str, **kwargs):
     """Get an LLM provider instance.
 
@@ -119,6 +127,8 @@ async def create_chat_completion(
             logging.getLogger(__name__).warning(
                 f"LLM request failed (attempt {attempt}/{max_attempts}): {exc}"
             )
+            if _is_non_retryable_llm_error(exc):
+                break
             if attempt < max_attempts:
                 await asyncio.sleep(min(2 ** (attempt - 1), 8))
                 continue

@@ -2,6 +2,7 @@ import json
 import os
 
 from gpt_researcher.config.config import Config
+from gpt_researcher.config.variables.default import DEFAULT_CONFIG
 
 
 class FakeResponse:
@@ -59,6 +60,66 @@ def test_llama_swap_running_model_becomes_default_llm(monkeypatch):
     assert "llama-swap" == os.environ["OPENAI_API_KEY"]
 
 
+def test_llama_swap_skips_non_chat_running_routes(monkeypatch):
+    clear_llm_env(monkeypatch)
+
+    def fake_urlopen(url, timeout):
+        return FakeResponse(
+            {
+                "running": [
+                    {
+                        "model": "comfyui-test-6000",
+                        "state": "ready",
+                        "cmd": "docker run pichiciego/comfyui:test",
+                        "proxy": "http://comfyui-test-6000:8188",
+                        "name": "ComfyUI Test RTX PRO 6000",
+                    },
+                    {
+                        "model": "laguna-s-2.1-nvfp4",
+                        "state": "ready",
+                        "cmd": "docker run vllm/vllm-openai:nightly --served-model-name laguna-s-2.1-nvfp4",
+                        "proxy": "http://host.docker.internal:14010",
+                    },
+                ]
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    cfg = Config()
+
+    assert cfg.fast_llm == "openai:laguna-s-2.1-nvfp4"
+    assert cfg.smart_llm == "openai:laguna-s-2.1-nvfp4"
+    assert cfg.strategic_llm == "openai:laguna-s-2.1-nvfp4"
+
+
+def test_llama_swap_does_not_select_non_chat_running_route(monkeypatch):
+    clear_llm_env(monkeypatch)
+
+    def fake_urlopen(url, timeout):
+        return FakeResponse(
+            {
+                "running": [
+                    {
+                        "model": "comfyui-test-6000",
+                        "state": "ready",
+                        "cmd": "docker run pichiciego/comfyui:test",
+                        "proxy": "http://comfyui-test-6000:8188",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    cfg = Config()
+
+    assert cfg.fast_llm == DEFAULT_CONFIG["FAST_LLM"]
+    assert cfg.smart_llm == DEFAULT_CONFIG["SMART_LLM"]
+    assert cfg.strategic_llm == DEFAULT_CONFIG["STRATEGIC_LLM"]
+    assert "OPENAI_BASE_URL" not in os.environ
+
+
 def test_llama_swap_does_not_override_explicit_llm_env(monkeypatch):
     clear_llm_env(monkeypatch)
     monkeypatch.setenv("FAST_LLM", "anthropic:claude-haiku-4-5")
@@ -112,9 +173,9 @@ def test_llama_swap_falls_back_to_default_when_no_running_model(monkeypatch):
 
     cfg = Config()
 
-    assert cfg.fast_llm == "openai:gpt-4o-mini"
-    assert cfg.smart_llm == "openai:gpt-4.1"
-    assert cfg.strategic_llm == "openai:o4-mini"
+    assert cfg.fast_llm == DEFAULT_CONFIG["FAST_LLM"]
+    assert cfg.smart_llm == DEFAULT_CONFIG["SMART_LLM"]
+    assert cfg.strategic_llm == DEFAULT_CONFIG["STRATEGIC_LLM"]
     assert "OPENAI_BASE_URL" not in os.environ
 
 

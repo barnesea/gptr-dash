@@ -166,6 +166,8 @@ class Config:
             model = cls._model_from_running_entry(entry)
             if not model:
                 continue
+            if not cls._running_entry_looks_like_chat_llm(entry, model):
+                continue
             state = ""
             if isinstance(entry, dict):
                 state = str(entry.get("state", "")).lower()
@@ -187,6 +189,53 @@ class Config:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return None
+
+    @staticmethod
+    def _running_entry_looks_like_chat_llm(entry: Any, model: str) -> bool:
+        if isinstance(entry, str):
+            return True
+        if not isinstance(entry, dict):
+            return False
+
+        fields = [
+            model,
+            str(entry.get("name", "")),
+            str(entry.get("description", "")),
+            str(entry.get("cmd", "")),
+            str(entry.get("proxy", "")),
+        ]
+        haystack = " ".join(fields).lower()
+
+        non_chat_markers = (
+            "comfyui",
+            "stable-diffusion",
+            "automatic1111",
+            "sd-webui",
+            "flux",
+            "image generation",
+            "diffusion",
+        )
+        if any(marker in haystack for marker in non_chat_markers):
+            return False
+
+        chat_markers = (
+            "vllm",
+            "llama.cpp",
+            "llama-server",
+            "sglang",
+            "text-generation-inference",
+            "tgi",
+            "aphrodite",
+            "tabbyapi",
+            "/v1/chat/completions",
+            "openai",
+            "chat-template",
+            "served-model-name",
+        )
+        if any(marker in haystack for marker in chat_markers):
+            return True
+
+        return not entry.get("cmd") and not entry.get("proxy")
 
     def _set_embedding_attributes(self) -> None:
         """Parse and set embedding provider and model attributes."""
