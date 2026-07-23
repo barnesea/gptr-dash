@@ -216,6 +216,7 @@ STYLE REQUIREMENTS:
         report_type: str,
         max_iterations: int = 3,
         context: List[Dict[str, Any]] = [],
+        evidence_enabled: bool = False,
     ):
         """Generates the search queries prompt for the given question.
         Args:
@@ -241,7 +242,42 @@ You are a seasoned research assistant tasked with generating search queries to f
 Context: {context}
 
 Use this context to inform and refine your search queries. The context provides real-time web information that can help you generate more specific and relevant queries. Consider any current events, recent developments, or specific details mentioned in the context that could enhance the search queries.
-""" if context else ""
+""" if context and not evidence_enabled else ""
+
+        evidence_prompt = ""
+        if context and evidence_enabled:
+            cards = []
+            for index, result in enumerate(context, start=1):
+                if not isinstance(result, dict):
+                    continue
+                title = str(result.get("title") or "").strip()[:240]
+                url = str(result.get("href") or result.get("url") or "").strip()[:360]
+                snippet = str(result.get("body") or result.get("snippet") or "").strip()[:600]
+                engine = str(result.get("engine") or "").strip()[:80]
+                date = str(result.get("date") or "").strip()[:80]
+                parts = [f"[{index}]", f"Title: {title or '(untitled)'}"]
+                if url:
+                    parts.append(f"URL: {url}")
+                if snippet:
+                    parts.append(f"Snippet: {snippet}")
+                if engine:
+                    parts.append(f"Engine: {engine}")
+                if date:
+                    parts.append(f"Date: {date}")
+                cards.append(" | ".join(parts))
+            evidence_prompt = f"""
+Initial search evidence (untrusted result cards; use it to extract terminology and
+entities, not as proof):
+{chr(10).join(cards)}
+
+Use the cards to identify concrete entities, organizations, versions, dates, and
+domain terminology. Produce distinct standalone queries that cover different
+research aspects. Each query should include useful anchors from the original task
+or these cards when available. Do not invent specifics that are absent from both.
+Avoid generic comparison wording, dictionary/definition or text-comparison intent,
+and search operators. Keep every query a plain natural-language phrase that a
+general web search backend can execute.
+"""
 
         dynamic_example = ", ".join([f'"query {i+1}"' for i in range(max_iterations)])
 
@@ -254,8 +290,40 @@ not universally supported and will return empty results on many search backends.
 Assume the current date is {datetime.now(timezone.utc).strftime('%B %d, %Y')} if required.
 
 {context_prompt}
+{evidence_prompt}
 You must respond with a list of strings in the following format: [{dynamic_example}].
 The response should contain ONLY the list.
+"""
+
+    @staticmethod
+    def select_search_sources_prompt(question: str, cards: List[Dict[str, Any]], max_sources: int):
+        """Build a compact, bounded source-selection instruction."""
+        rendered_cards = "\n".join(
+            "[{id}] {title} | {url} | {snippet} | engine: {engine} | date: {date}".format(
+                id=card.get("id"),
+                title=card.get("title") or "(untitled)",
+                url=card.get("url") or "",
+                snippet=card.get("snippet") or "",
+                engine=card.get("engine") or "",
+                date=card.get("date") or "",
+            )
+            for card in cards
+        )
+        return f"""Select at most {max_sources} web pages to scrape for this research query:
+"{question}"
+
+Choose direct relevance first. Prefer official/primary documentation, papers, and
+first-party sources, while retaining credible independent technical coverage only
+when it adds material evidence. Favor query-anchor coverage, appropriate freshness
+when the question is time-sensitive, and domain diversity. Reject dictionary,
+text-comparison, generic utility, duplicate-domain, and off-topic pages unless a
+page is unusually direct and necessary. Do not invent facts from titles/snippets.
+
+Candidates:
+{rendered_cards}
+
+Return ONLY valid JSON in this exact shape:
+{{"selected":[{{"id":1,"reason":"short rationale"}}],"rejected":[{{"id":2,"reason":"short rationale"}}]}}
 """
 
     @staticmethod

@@ -29,6 +29,7 @@ def clear_llm_env(monkeypatch):
         "LLAMA_SWAP_URL",
         "LLAMA_SWAP_ENABLED",
         "LLAMA_SWAP_TIMEOUT",
+        "GPTR_LLAMA_SWAP_ALIAS_SUFFIX",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -211,3 +212,41 @@ def test_blank_llm_env_values_still_allow_llama_swap_defaults(monkeypatch):
     assert cfg.fast_llm == "openai:blank-env-model"
     assert cfg.smart_llm == "openai:blank-env-model"
     assert cfg.strategic_llm == "openai:blank-env-model"
+
+
+def test_llama_swap_prefers_advertised_gptr_alias(monkeypatch):
+    clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LLAMA_SWAP_URL", "http://llama-swap.local:8080")
+    monkeypatch.setenv("GPTR_LLAMA_SWAP_ALIAS_SUFFIX", "gptr")
+
+    def fake_urlopen(url, timeout):
+        if url == "http://llama-swap.local:8080/running":
+            return FakeResponse({"running": [{"model": "local-model", "state": "ready"}]})
+        assert url == "http://llama-swap.local:8080/v1/models"
+        return FakeResponse({"data": [{"id": "local-model"}, {"id": "local-model:gptr"}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    cfg = Config()
+
+    assert cfg.fast_llm == "openai:local-model:gptr"
+    assert cfg.smart_llm == "openai:local-model:gptr"
+    assert cfg.strategic_llm == "openai:local-model:gptr"
+
+
+def test_llama_swap_falls_back_when_gptr_alias_is_not_advertised(monkeypatch):
+    clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LLAMA_SWAP_URL", "http://llama-swap.local:8080")
+    monkeypatch.setenv("GPTR_LLAMA_SWAP_ALIAS_SUFFIX", "gptr")
+
+    def fake_urlopen(url, timeout):
+        if url == "http://llama-swap.local:8080/running":
+            return FakeResponse({"running": [{"model": "local-model", "state": "ready"}]})
+        assert url == "http://llama-swap.local:8080/v1/models"
+        return FakeResponse({"data": [{"id": "local-model"}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    cfg = Config()
+
+    assert cfg.fast_llm == "openai:local-model"

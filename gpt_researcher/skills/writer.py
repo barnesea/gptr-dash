@@ -14,6 +14,10 @@ from ..actions import (
     write_conclusion,
     write_report_introduction,
 )
+from ..actions.report_generation import (
+    enforce_verified_citation_urls,
+    report_citation_urls,
+)
 from ..utils.llm import construct_subtopics
 
 
@@ -110,6 +114,14 @@ class ReportGenerator:
         report_params["context"] = context
         report_params["custom_prompt"] = custom_prompt
         report_params["available_images"] = available_images  # Pass pre-generated images
+        verified_source_urls = list(
+            dict.fromkeys(
+                str(source.get("url") or source.get("href") or "").strip()
+                for source in self.researcher.get_research_sources()
+                if str(source.get("url") or source.get("href") or "").strip()
+            )
+        )
+        report_params["verified_source_urls"] = verified_source_urls
 
         if self.researcher.report_type == "subtopic_report":
             report_params.update({
@@ -122,6 +134,33 @@ class ReportGenerator:
             report_params["cost_callback"] = self.researcher.add_costs
 
         report = await generate_report(**report_params, **self.researcher.kwargs)
+        citations_before = report_citation_urls(report)
+        report = enforce_verified_citation_urls(
+            report,
+            verified_source_urls,
+        )
+        citations_after = report_citation_urls(report)
+        trace = getattr(self.researcher, "trace_event", None)
+        if trace:
+            trace(
+                "report_citation_guard",
+                {
+                    "verified_source_count": len(verified_source_urls),
+                    "citation_count_before": len(citations_before),
+                    "citation_count_after": len(citations_after),
+                    "removed_or_rewritten_count": len(
+                        citations_before - citations_after
+                    ),
+                    "all_citations_verified": all(
+                        any(
+                            citation.rstrip("/").lower()
+                            == source.rstrip("/").lower()
+                            for source in verified_source_urls
+                        )
+                        for citation in citations_after
+                    ),
+                },
+            )
 
         if self.researcher.verbose:
             await stream_output(

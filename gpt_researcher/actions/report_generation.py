@@ -1,5 +1,7 @@
 import asyncio
+import re
 from typing import List, Dict, Any
+from urllib.parse import urlparse
 from ..config.config import Config
 from ..utils.llm import create_chat_completion
 from ..utils.logger import get_formatted_logger
@@ -7,6 +9,67 @@ from ..prompts import PromptFamily, get_prompt_by_report_type
 from ..utils.enum import Tone
 
 logger = get_formatted_logger()
+
+MARKDOWN_LINK_PATTERN = re.compile(
+    r"(?<!!)\[([^\]]+)\]\((https?://[^)\s]+)\)",
+    re.IGNORECASE,
+)
+REFERENCE_HEADING_PATTERN = re.compile(
+    r"(?im)^#{1,6}\s+references\s*$"
+)
+
+
+def _normalized_citation_url(url: str) -> str:
+    return str(url or "").strip().rstrip("/").lower()
+
+
+def report_citation_urls(report: str) -> set[str]:
+    """Return ordinary Markdown-link targets, excluding embedded images."""
+    return {
+        match.group(2).strip()
+        for match in MARKDOWN_LINK_PATTERN.finditer(report or "")
+    }
+
+
+def enforce_verified_citation_urls(
+    report: str,
+    verified_source_urls: list[str],
+) -> str:
+    """Ensure the final report cannot cite URLs outside verified evidence."""
+    allowed = {
+        _normalized_citation_url(url): str(url).strip()
+        for url in verified_source_urls
+        if str(url).strip()
+    }
+    by_domain: dict[str, list[str]] = {}
+    for original in allowed.values():
+        domain = urlparse(original).netloc.lower().removeprefix("www.")
+        if domain:
+            by_domain.setdefault(domain, []).append(original)
+
+    def replace_link(match: re.Match[str]) -> str:
+        label, url = match.group(1), match.group(2)
+        normalized = _normalized_citation_url(url)
+        if normalized in allowed:
+            return f"[{label}]({allowed[normalized]})"
+        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        same_domain = list(dict.fromkeys(by_domain.get(domain, [])))
+        if len(same_domain) == 1:
+            # The claim came from a verified page on this domain, but the model
+            # followed an unverified link embedded inside that page.
+            return f"[{label}]({same_domain[0]})"
+        return label
+
+    # Rebuild the references section from the allowlist so wrapped or
+    # hallucinated reference entries cannot survive a regex-only cleanup.
+    body = REFERENCE_HEADING_PATTERN.split(report or "", maxsplit=1)[0].rstrip()
+    body = MARKDOWN_LINK_PATTERN.sub(replace_link, body)
+    if not allowed:
+        return body
+    references = "\n".join(
+        f"- [{url}]({url})" for url in sorted(allowed.values())
+    )
+    return f"{body}\n\n## References\n\n{references}\n"
 
 
 async def write_report_introduction(
@@ -223,6 +286,7 @@ async def generate_report(
     headers=None,
     prompt_family: type[PromptFamily] | PromptFamily = PromptFamily,
     available_images: list = None,
+    verified_source_urls: list[str] | None = None,
     **kwargs
 ):
     """
@@ -247,6 +311,11 @@ async def generate_report(
 
     """
     available_images = available_images or []
+    verified_source_urls = [
+        str(url).strip()
+        for url in (verified_source_urls or [])
+        if str(url).strip()
+    ]
     generate_prompt = get_prompt_by_report_type(report_type, prompt_family)
     report = ""
 
@@ -256,6 +325,19 @@ async def generate_report(
         content = f"{custom_prompt}\n\nContext: {context}"
     else:
         content = f"{generate_prompt(query, context, report_source, report_format=cfg.report_format, tone=tone, total_words=cfg.total_words, language=cfg.language)}"
+
+    if verified_source_urls:
+        content += f"""
+
+VERIFIED CITATION URL ALLOWLIST:
+{verified_source_urls}
+
+Citation safety requirements:
+- Cite only the exact URLs in this allowlist.
+- URLs appearing inside source-page content are not verified sources and must
+  not be cited unless they also appear in the allowlist.
+- Do not invent, expand, shorten, or substitute citation URLs.
+"""
     
     # Add available images instruction if images were pre-generated
     if available_images:

@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from gpt_researcher.skills.researcher import ResearchConductor
 
@@ -42,7 +43,10 @@ class ResearchConductorRetrievalTests(unittest.IsolatedAsyncioTestCase):
         class FakeResearcher:
             def __init__(self):
                 self.retrievers = [retriever_class]
-                self.cfg = SimpleNamespace(max_search_results_per_query=5)
+                self.cfg = SimpleNamespace(
+                    max_search_results_per_query=5,
+                    pre_scrape_source_curation=False,
+                )
                 self.verbose = False
                 self.websocket = None
                 self.visited_urls = set()
@@ -57,25 +61,85 @@ class ResearchConductorRetrievalTests(unittest.IsolatedAsyncioTestCase):
         researcher = self.make_researcher(FakeSnippetRetriever)
         conductor = ResearchConductor(researcher)
 
-        urls, prefetched = await conductor._search_relevant_source_urls("rust async runtimes")
+        urls, prefetched, candidates = await conductor._search_relevant_source_urls(
+            "rust async runtimes"
+        )
 
         self.assertCountEqual(
             urls,
             ["https://example.com/one", "https://example.com/two"],
         )
         self.assertEqual(prefetched, [])
+        self.assertEqual(set(candidates), set(urls))
 
     async def test_raw_content_results_stay_prefetched(self):
         researcher = self.make_researcher(FakeFullContentRetriever)
         conductor = ResearchConductor(researcher)
 
-        urls, prefetched = await conductor._search_relevant_source_urls("pubmed article")
+        urls, prefetched, candidates = await conductor._search_relevant_source_urls(
+            "pubmed article"
+        )
 
         self.assertEqual(urls, [])
         self.assertEqual(
             prefetched,
-            [{"url": "https://example.com/full", "raw_content": "C" * 500}],
+            [{
+                "url": "https://example.com/full",
+                "raw_content": "C" * 500,
+                "title": "",
+            }],
         )
+        self.assertEqual(list(candidates), ["https://example.com/full"])
+
+    async def test_only_selected_urls_are_passed_to_the_scraper(self):
+        researcher = self.make_researcher(FakeSnippetRetriever)
+        researcher.cfg.pre_scrape_source_curation = True
+        researcher.scraper_manager = SimpleNamespace(calls=[])
+
+        async def browse_urls(urls, **kwargs):
+            researcher.scraper_manager.calls.append(urls)
+            return []
+
+        researcher.scraper_manager.browse_urls = browse_urls
+        researcher.vector_store = None
+        conductor = ResearchConductor(researcher)
+
+        async def select_only_second(query, candidates):
+            return [candidates[1]]
+
+        conductor._select_source_candidates = select_only_second
+        await conductor._scrape_data_by_urls("rust async runtimes")
+
+        self.assertEqual(researcher.scraper_manager.calls, [["https://example.com/two"]])
+
+    async def test_model_selected_off_topic_card_is_blocked_by_anchor_guard(self):
+        researcher = self.make_researcher(FakeSnippetRetriever)
+        researcher.cfg = SimpleNamespace(
+            max_search_results_per_query=5,
+            pre_scrape_source_curation=True,
+            pre_scrape_max_sources_per_query=3,
+            source_curation_policy="balanced",
+            fast_llm_model="test-model",
+            fast_llm_provider="openai",
+            llm_kwargs={},
+        )
+        researcher.kwargs = {}
+        researcher.add_costs = lambda _cost: None
+        conductor = ResearchConductor(researcher)
+        candidates = [
+            {"href": "https://example.com/gnome", "title": "GNOME on Linux", "body": "Linux desktop fractional scaling"},
+            {"href": "https://kernel.org/6.12", "title": "Linux 6.12 io_uring", "body": "io_uring async discard changes"},
+        ]
+        model_payload = '{"selected":[{"id":1,"reason":"bad choice"},{"id":2,"reason":"relevant"}]}'
+
+        with patch("gpt_researcher.skills.researcher.create_chat_completion", new=AsyncMock(return_value=model_payload)), patch(
+            "gpt_researcher.skills.researcher.stream_output", new=AsyncMock()
+        ):
+            selected = await conductor._select_source_candidates(
+                "Linux kernel 6.12 io_uring changes", candidates
+            )
+
+        self.assertEqual([item["href"] for item in selected], ["https://kernel.org/6.12"])
 
 
 if __name__ == "__main__":

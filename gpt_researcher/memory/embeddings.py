@@ -25,6 +25,8 @@ Supported providers:
 import os
 from typing import Any
 
+from langchain_core.embeddings import Embeddings
+
 OPENAI_EMBEDDING_MODEL = os.environ.get(
     "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
 )
@@ -52,6 +54,50 @@ _SUPPORTED_PROVIDERS = {
     "minimax",
     "nebius",
 }
+
+
+class QueryInstructionEmbeddings(Embeddings):
+    """Apply optional, asymmetric query and document prefixes.
+
+    Retrieval-tuned embedding models commonly use an asymmetric format: plain
+    Keeping the transformation here makes it work consistently for LangChain
+    vector stores and contextual-compression filters.  The legacy instruction
+    format remains available for models such as Qwen; retrieval models with
+    native ``Query:`` / ``Document:`` conventions can instead use explicit
+    prefixes for both sides of the retrieval pair.
+    """
+
+    def __init__(
+        self,
+        embeddings: Embeddings,
+        instruction: str = "",
+        query_prefix: str = "",
+        document_prefix: str = "",
+    ):
+        self._embeddings = embeddings
+        self._query_prefix = query_prefix or (
+            f"Instruct: {instruction.strip()}\\nQuery: " if instruction.strip() else ""
+        )
+        self._document_prefix = document_prefix
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embeddings.embed_documents(
+            [f"{self._document_prefix}{text}" for text in texts]
+        )
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embeddings.embed_query(f"{self._query_prefix}{text}")
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        return await self._embeddings.aembed_documents(
+            [f"{self._document_prefix}{text}" for text in texts]
+        )
+
+    async def aembed_query(self, text: str) -> list[float]:
+        return await self._embeddings.aembed_query(f"{self._query_prefix}{text}")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._embeddings, name)
 
 
 class Memory:
@@ -93,7 +139,8 @@ class Memory:
                     model=model,
                     openai_api_key=os.getenv("OPENAI_API_KEY", "custom"),
                     openai_api_base=os.getenv(
-                        "OPENAI_BASE_URL", "http://localhost:1234/v1"
+                        "EMBEDDING_OPENAI_BASE_URL",
+                        os.getenv("OPENAI_BASE_URL", "http://localhost:1234/v1"),
                     ),  # default for lmstudio
                     check_embedding_ctx_length=False,
                     **embedding_kwargs,
@@ -101,9 +148,12 @@ class Memory:
             case "openai":
                 from langchain_openai import OpenAIEmbeddings
 
-                # Support custom OpenAI-compatible APIs via OPENAI_BASE_URL
-                if "openai_api_base" not in embedding_kwargs and os.environ.get("OPENAI_BASE_URL"):
-                    embedding_kwargs["openai_api_base"] = os.environ["OPENAI_BASE_URL"]
+                # Embedder and chat endpoints can be routed independently.
+                # This is needed when a pooling vLLM server is used for
+                # embeddings alongside a chat-serving llama-swap endpoint.
+                embedding_base_url = os.getenv("EMBEDDING_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+                if "openai_api_base" not in embedding_kwargs and embedding_base_url:
+                    embedding_kwargs["openai_api_base"] = embedding_base_url
 
                 _embeddings = OpenAIEmbeddings(model=model, **embedding_kwargs)
             case "azure_openai":
@@ -224,7 +274,19 @@ class Memory:
             case _:
                 raise Exception("Embedding not found.")
 
-        self._embeddings = _embeddings
+        instruction = os.getenv("EMBEDDING_QUERY_INSTRUCTION", "").strip()
+        query_prefix = os.getenv("EMBEDDING_QUERY_PREFIX", "")
+        document_prefix = os.getenv("EMBEDDING_DOCUMENT_PREFIX", "")
+        self._embeddings = (
+            QueryInstructionEmbeddings(
+                _embeddings,
+                instruction=instruction,
+                query_prefix=query_prefix,
+                document_prefix=document_prefix,
+            )
+            if instruction or query_prefix or document_prefix
+            else _embeddings
+        )
 
     def get_embeddings(self):
         """Get the configured embeddings instance.

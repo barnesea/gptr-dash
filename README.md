@@ -98,6 +98,14 @@ can clone or pull the GitHub repo during a stack deploy, run
 `docker compose build`, and redeploy the backend, Next.js UI, and MCP
 containers from the freshly built images.
 
+Deep-research deployments can compare tree expansion and branch retrieval
+independently with `DEEP_RESEARCH_TREE_POLICY` (`ranked` or `legacy_all`) and
+`DEEP_RESEARCH_BRANCH_MODE` (`focused` or `standard`). Leaving both at `auto`
+preserves the existing `DEEP_RESEARCH_FOCUSED_RETRIEVAL` compatibility switch.
+When `RESEARCH_TRAJECTORY_ENABLED=true`, each MCP job writes an append-only
+JSONL trace beneath the configured persistent `RESEARCH_TRAJECTORY_DIR`; use
+`evals/trajectory_compare.py` to summarize multiple policy runs.
+
 ## ⚙️ Getting Started
 
 ### Installation
@@ -219,13 +227,27 @@ Images are generated with dark-mode styling that matches the GPT Researcher UI, 
 
 ## ✨ Deep Research
 
-GPT Researcher now includes Deep Research - an advanced recursive research workflow that explores topics with agentic depth and breadth. This feature employs a tree-like exploration pattern, diving deeper into subtopics while maintaining a comprehensive view of the research subject.
+The MCP deep-research tool exposes a best-effort research duration instead of
+caller-selected breadth and depth:
 
-- 🌳 Tree-like exploration with configurable depth and breadth
-- ⚡️ Concurrent processing for faster results
-- 🤝 Smart context management across research branches
-- ⏱️ Takes ~5 minutes per deep research
-- 💰 Costs ~$0.4 per research (using `o3-mini` on "high" reasoning effort)
+```text
+deep_research(query, research_duration_seconds=60)
+```
+
+The accepted range is 15–600 seconds and excludes final report generation.
+The backend calculates bounded aspect coverage, selective repair, source-card
+and scrape limits, and focused deepening at job start. It never creates nested
+planner trees and never cancels active work to enforce a hard deadline.
+
+- 🌳 Structured, original-query-anchored aspect planning
+- 🛠️ Coverage repair before optional deepening
+- 🛡️ Verified primary/reputable evidence and corroborated broader-web fallback
+- ⚡️ Shared concurrency of four across focused branches
+- 📈 Job trajectories with timing calibration and compression diagnostics
+
+`RESEARCH_DURATION_CONTROLLER_MODE=off` restores the internal 2/3
+ranked/focused policy. Use `shadow` to collect calibration trajectories before
+switching to `enabled`.
 
 [Learn more about Deep Research](https://docs.gptr.dev/docs/gpt-researcher/gptr/deep_research) in our documentation.
 

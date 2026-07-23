@@ -25,7 +25,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gpt_researcher import GPTResearcher
+from gpt_researcher.config import Config
 from gpt_researcher.utils.enum import ReportType
+from gpt_researcher.utils.research_budget import (
+    build_research_policy,
+    execution_policy,
+    validate_research_duration,
+)
 
 # Load environment variables
 load_dotenv()
@@ -36,6 +42,7 @@ from utils import (
     handle_exception,
     get_researcher_by_id, 
     format_sources_for_response,
+    source_urls_from_sources,
     format_context_with_sources, 
     store_research_results,
     create_research_prompt
@@ -99,6 +106,11 @@ def _openwebui_events_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a conventional boolean environment switch without raising."""
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_openwebui_request_headers() -> dict[str, str]:
@@ -275,6 +287,61 @@ def get_deep_research_cooldown_seconds() -> int:
     return max(cooldown, 0)
 
 
+def _get_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s=%r, defaulting to %s", name, raw_value, default)
+        return default
+    return max(1, value)
+
+
+def get_deep_research_max_depth() -> int:
+    """Return the maximum recursive depth exposed through the MCP tool."""
+    return _get_positive_int_env("MCP_DEEP_RESEARCH_MAX_DEPTH", 2)
+
+
+def get_deep_research_max_breadth() -> int:
+    """Return the maximum branch count exposed through the MCP tool."""
+    return _get_positive_int_env("MCP_DEEP_RESEARCH_MAX_BREADTH", 3)
+
+
+def validate_deep_research_budget(depth: int, breadth: int) -> Dict[str, Any] | None:
+    """Return a structured error when a requested research budget is unsafe."""
+    max_depth = get_deep_research_max_depth()
+    max_breadth = get_deep_research_max_breadth()
+    if 1 <= depth <= max_depth and 1 <= breadth <= max_breadth:
+        return None
+    return {
+        "status": "invalid_research_budget",
+        "message": (
+            f"depth must be between 1 and {max_depth}, and breadth must be between "
+            f"1 and {max_breadth}."
+        ),
+        "requested_depth": depth,
+        "requested_breadth": breadth,
+        "max_depth": max_depth,
+        "max_breadth": max_breadth,
+    }
+
+
+def validate_research_duration_input(
+    research_duration_seconds: Any,
+) -> tuple[int | None, Dict[str, Any] | None]:
+    """Validate the only public deep-research budget input."""
+    try:
+        return validate_research_duration(research_duration_seconds), None
+    except ValueError as exc:
+        return None, {
+            "status": "invalid_research_duration",
+            "message": str(exc),
+            "requested_research_duration_seconds": research_duration_seconds,
+            "min_research_duration_seconds": 15,
+            "max_research_duration_seconds": 600,
+        }
+
+
 def _deep_research_rate_limited_response(wait_seconds: int) -> Dict[str, Any]:
     return {
         "status": "rate_limited",
@@ -359,9 +426,39 @@ def check_research_dependency_status() -> Dict[str, Any]:
             "mcp_max_concurrent_deep_research": get_deep_research_limit(),
             "mcp_deep_research_active_jobs": _deep_research_active_jobs,
             "mcp_deep_research_cooldown_seconds": get_deep_research_cooldown_seconds(),
+            "mcp_deep_research_max_depth": get_deep_research_max_depth(),
+            "mcp_deep_research_max_breadth": get_deep_research_max_breadth(),
+            "research_duration_controller_mode": os.getenv(
+                "RESEARCH_DURATION_CONTROLLER_MODE", "off"
+            ),
+            "research_duration_default_seconds": os.getenv(
+                "RESEARCH_DURATION_DEFAULT_SECONDS", "60"
+            ),
+            "research_budget_calibration_enabled": os.getenv(
+                "RESEARCH_BUDGET_CALIBRATION_ENABLED", "true"
+            ),
+            "deep_research_adaptive_compression": os.getenv(
+                "DEEP_RESEARCH_ADAPTIVE_COMPRESSION", "false"
+            ),
+            "deep_research_fallback_corroboration": os.getenv(
+                "DEEP_RESEARCH_FALLBACK_CORROBORATION", "2"
+            ),
+            "deep_research_fallback_corroboration_enabled": os.getenv(
+                "DEEP_RESEARCH_FALLBACK_CORROBORATION_ENABLED", "false"
+            ),
             "recursive_deep_research_breadth": os.getenv("DEEP_RESEARCH_BREADTH", ""),
             "recursive_deep_research_depth": os.getenv("DEEP_RESEARCH_DEPTH", ""),
             "recursive_deep_research_concurrency": os.getenv("DEEP_RESEARCH_CONCURRENCY", ""),
+            "deep_research_focused_retrieval": os.getenv("DEEP_RESEARCH_FOCUSED_RETRIEVAL", ""),
+            "deep_research_tree_policy": os.getenv("DEEP_RESEARCH_TREE_POLICY", ""),
+            "deep_research_branch_mode": os.getenv("DEEP_RESEARCH_BRANCH_MODE", ""),
+            "deep_research_max_deepened_branches": os.getenv("DEEP_RESEARCH_MAX_DEEPENED_BRANCHES", ""),
+            "deep_research_min_deepening_score": os.getenv("DEEP_RESEARCH_MIN_DEEPENING_SCORE", ""),
+            "deep_research_source_standards": os.getenv("DEEP_RESEARCH_SOURCE_STANDARDS", ""),
+            "deep_research_direct_url_seed": os.getenv("DEEP_RESEARCH_DIRECT_URL_SEED", ""),
+            "source_selector_mode": os.getenv("SOURCE_SELECTOR_MODE", ""),
+            "research_trajectory_enabled": os.getenv("RESEARCH_TRAJECTORY_ENABLED", ""),
+            "research_trajectory_dir": os.getenv("RESEARCH_TRAJECTORY_DIR", ""),
         },
         "searx": {"enabled": retriever in {"searx", "searxng"}},
         "crawl4ai": {"enabled": scraper == "crawl4ai"},
@@ -450,7 +547,7 @@ async def research_resource(topic: str) -> str:
         # Get the context and sources
         context = researcher.get_research_context()
         sources = researcher.get_research_sources()
-        source_urls = researcher.get_source_urls()
+        source_urls = source_urls_from_sources(sources)
         
         # Format with sources included
         formatted_context = format_context_with_sources(topic, context, sources)
@@ -464,19 +561,42 @@ async def research_resource(topic: str) -> str:
 
 
 @mcp.tool()
-async def deep_research(query: str, ctx: Context) -> Dict[str, Any]:
+async def deep_research(
+    query: str,
+    ctx: Context,
+    research_duration_seconds: int = 60,
+) -> Dict[str, Any]:
     """
     Conduct a web deep research on a given query using GPT Researcher. 
     Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
     
     Args:
         query: The research query or topic
+        research_duration_seconds: Best-effort research time target, excluding
+            final report generation. Choose 15-29 seconds for a focused answer,
+            30-59 for a small multi-part question, 60-119 for normal deep
+            research, 120-239 for broad or versioned topics, and 240-600 for
+            extensive synthesis. The backend converts the duration into bounded
+            coverage, recovery, corroboration, and deepening limits.
         
     Returns:
-        Dict containing research status, ID, and the actual research context and sources
-        that can be used directly by LLMs for context enrichment
+        Dict containing a cited, final GPT Researcher report and its sources.  On
+        success, return the report directly to the user. Do not run extra quick
+        searches or call write_report afterwards: this tool already completes
+        both research and report writing in one bounded operation.
     """
-    await _mcp_info(ctx, f"Starting deep research: {query}")
+    duration, budget_error = validate_research_duration_input(
+        research_duration_seconds
+    )
+    if budget_error is not None:
+        await _mcp_info(ctx, budget_error["message"])
+        await _openwebui_status(ctx, budget_error["message"], done=True)
+        return budget_error
+
+    await _mcp_info(
+        ctx,
+        f"Starting deep research (target={duration}s, report time excluded): {query}",
+    )
     await _mcp_progress(ctx, 0, 1, "Deep research queued")
 
     refusal = await admit_deep_research_call()
@@ -487,15 +607,36 @@ async def deep_research(query: str, ctx: Context) -> Dict[str, Any]:
         return refusal
 
     try:
-        return await _run_deep_research(query, ctx)
+        return await _run_deep_research(
+            query, ctx, research_duration_seconds=duration or 60
+        )
     finally:
         await release_deep_research_call()
 
 
-async def _run_deep_research(query: str, ctx: Context | None = None) -> Dict[str, Any]:
+async def _run_deep_research(
+    query: str,
+    ctx: Context | None = None,
+    *,
+    research_duration_seconds: int = 60,
+) -> Dict[str, Any]:
     """Run a deep research job after concurrency admission."""
-    logger.info(f"Conducting research on query: {query}...")
-    await _mcp_progress(ctx, 0, 1, "Deep research started")
+    cfg = Config()
+    calculated_policy = build_research_policy(research_duration_seconds, cfg)
+    active_policy = execution_policy(calculated_policy, cfg)
+    logger.info(
+        "Conducting research with target=%ss, mode=%s, aspects=%s: %s...",
+        research_duration_seconds,
+        calculated_policy.controller_mode,
+        active_policy.aspect_count,
+        query,
+    )
+    await _mcp_progress(
+        ctx,
+        0,
+        1,
+        f"Deep research started (target={research_duration_seconds}s)",
+    )
     
     # Generate a unique ID for this research session
     research_id = str(uuid.uuid4())
@@ -507,38 +648,126 @@ async def _run_deep_research(query: str, ctx: Context | None = None) -> Dict[str
     )
 
     # Initialize GPT Researcher
-    researcher = GPTResearcher(query, report_type=report_type)
+    researcher = GPTResearcher(
+        query,
+        report_type=report_type,
+        trajectory_id=research_id,
+        research_policy=active_policy,
+    )
+    if report_type == ReportType.DeepResearch.value and researcher.deep_researcher:
+        researcher.deep_researcher.depth = active_policy.max_depth
+        researcher.deep_researcher.breadth = active_policy.aspect_count
+        researcher.deep_researcher.max_deepened_branches = (
+            active_policy.max_deepened_branches
+        )
+    researcher.trace_event("research_budget", calculated_policy.to_dict())
     on_progress = _build_deep_research_progress_callback(ctx)
     
     # Start research
     try:
+        research_started_at = time.perf_counter()
         await researcher.conduct_research(on_progress=on_progress)
+        actual_research_duration = time.perf_counter() - research_started_at
         await _drain_progress_tasks(on_progress)
         mcp.researchers[research_id] = researcher
         logger.info(f"Research completed for ID: {research_id}")
-        await _mcp_progress(ctx, 1, 1, "Deep research completed", done=True)
-        await _mcp_info(ctx, f"Deep research completed: {research_id}")
+        await _mcp_info(ctx, "Deep research completed; preparing the cited report.")
         
         # Get the research context and sources
         context = researcher.get_research_context()
         sources = researcher.get_research_sources()
-        source_urls = researcher.get_source_urls()
+        source_urls = source_urls_from_sources(sources)
         
         # Store in the research store for the resource API
         store_research_results(query, context, sources, source_urls)
-        
-        return create_success_response({
-            "research_id": research_id,
+
+        response: Dict[str, Any] = {
             "query": query,
             "report_type": report_type,
             "recursive_deep_research_enabled": recursive_deep_research_enabled(),
+            "requested_research_duration_seconds": research_duration_seconds,
+            "estimated_research_duration_seconds": (
+                calculated_policy.estimated_research_seconds
+            ),
+            "actual_research_duration_seconds": round(
+                actual_research_duration, 3
+            ),
+            "report_generation_duration_seconds": None,
+            "calculated_policy": calculated_policy.to_dict(),
+            "execution_policy": active_policy.to_dict(),
+            "calibration_source": calculated_policy.calibration_source,
+            "calibration_sample_count": calculated_policy.calibration_sample_count,
             "source_count": len(sources),
-            "context": context,
             "sources": format_sources_for_response(sources),
-            "source_urls": source_urls
-        })
+            "source_urls": source_urls,
+            "coverage_ledger": researcher.coverage_ledger,
+        }
+        if researcher.deep_researcher:
+            response["tree_policy"] = researcher.deep_researcher.tree_policy
+            response["branch_mode"] = researcher.deep_researcher.branch_mode
+        if researcher.trajectory:
+            response["trajectory_id"] = researcher.trajectory.job_id
+        # A UUID is too easy for a chat model to transcribe incorrectly.  The
+        # default response is self-contained, while an explicit diagnostics
+        # switch retains the old multi-tool workflow for debugging clients.
+        if _env_flag("MCP_DEEP_RESEARCH_RETURN_REPORT", True):
+            await _mcp_progress(ctx, 1, 1, "Writing cited research report")
+            researcher.trace_event("report_generation", {"state": "started"})
+            report_started_at = time.perf_counter()
+            report = await researcher.write_report()
+            report_duration = time.perf_counter() - report_started_at
+            researcher.trace_event("report_generation", {
+                "state": "completed",
+                "duration_seconds": round(report_duration, 3),
+                "report_chars": len(report or ""),
+            })
+            researcher.trace_event(
+                "stage_timing",
+                {
+                    "stage": "reporting",
+                    "duration_seconds": round(report_duration, 3),
+                    "estimated_seconds": calculated_policy.estimated_stage_seconds.get(
+                        "reporting", 0.0
+                    ),
+                },
+            )
+            response["report"] = report
+            response["report_generated"] = True
+            response["report_generation_duration_seconds"] = round(
+                report_duration, 3
+            )
+        else:
+            response["context"] = context
+            response["report_generated"] = False
+        if _env_flag("MCP_EXPOSE_RESEARCH_ID", False):
+            response["research_id"] = research_id
+        evidence_status = (
+            "success"
+            if sources and str(context or "").strip()
+            else "insufficient_evidence"
+        )
+        if researcher.trajectory:
+            researcher.trajectory.finalize(evidence_status, {
+                "source_count": len(sources),
+                "context_chars": len(str(context or "")),
+                "report_generated": response["report_generated"],
+                "actual_research_duration_seconds": round(
+                    actual_research_duration, 3
+                ),
+                "report_generation_duration_seconds": response[
+                    "report_generation_duration_seconds"
+                ],
+                "requested_research_duration_seconds": research_duration_seconds,
+                "estimated_research_duration_seconds": (
+                    calculated_policy.estimated_research_seconds
+                ),
+            })
+        await _mcp_progress(ctx, 1, 1, "Deep research report completed", done=True)
+        return {"status": evidence_status, **response}
     except Exception as e:
         await _drain_progress_tasks(on_progress)
+        if researcher.trajectory:
+            researcher.trajectory.finalize("error", {"error": str(e)})
         await _mcp_info(ctx, f"Deep research failed: {e}")
         await _openwebui_status(ctx, f"Deep research failed: {e}", done=True)
         return handle_exception(e, "Research")
@@ -584,7 +813,9 @@ async def quick_search(query: str) -> Dict[str, Any]:
 @mcp.tool()
 async def write_report(research_id: str, custom_prompt: Optional[str] = None) -> Dict[str, Any]:
     """
-    Generate a report based on previously conducted research.
+    Legacy diagnostic tool for generating a report from an explicitly exposed
+    research ID. Normal deep_research calls already return the cited report;
+    do not call this after deep_research.
     
     Args:
         research_id: The ID of the research session from deep_research
@@ -632,7 +863,7 @@ async def get_research_sources(research_id: str) -> Dict[str, Any]:
         return error
     
     sources = researcher.get_research_sources()
-    source_urls = researcher.get_source_urls()
+    source_urls = source_urls_from_sources(sources)
     
     return create_success_response({
         "sources": format_sources_for_response(sources),

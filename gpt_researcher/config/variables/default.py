@@ -19,6 +19,16 @@ DEFAULT_CONFIG: BaseConfig = {
     "TEMPERATURE": 0.4,
     "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
     "MAX_SEARCH_RESULTS_PER_QUERY": 5,
+    # Evidence-grounded planning and pre-scrape selection are opt-in at the
+    # package level so existing deployments retain their current behavior.
+    "PLANNING_EVIDENCE_ENABLED": False,
+    "PLANNING_SEARCH_RESULTS": 8,
+    "PRE_SCRAPE_SOURCE_CURATION": False,
+    "PRE_SCRAPE_MAX_SOURCES_PER_QUERY": 3,
+    # Verify that fetched content still matches its selected SERP card before
+    # it reaches the evidence context.  Opt-in preserves package behavior.
+    "POST_SCRAPE_SOURCE_INTEGRITY": False,
+    "SOURCE_CURATION_POLICY": "balanced",
     "MEMORY_BACKEND": "local",
     "TOTAL_WORDS": 1200,
     "REPORT_FORMAT": "APA",
@@ -39,6 +49,39 @@ DEFAULT_CONFIG: BaseConfig = {
     "DEEP_RESEARCH_BREADTH": 3,
     "DEEP_RESEARCH_DEPTH": 2,
     "DEEP_RESEARCH_CONCURRENCY": 4,
+    # Recursive branches are deliberately focused: the deep-research tree owns
+    # breadth, so branch researchers must not multiply it again.
+    "DEEP_RESEARCH_FOCUSED_RETRIEVAL": True,
+    # "auto" preserves DEEP_RESEARCH_FOCUSED_RETRIEVAL as the compatibility
+    # switch. Explicit values decouple tree expansion from branch retrieval for
+    # controlled trajectory comparisons.
+    "DEEP_RESEARCH_TREE_POLICY": "auto",
+    "DEEP_RESEARCH_BRANCH_MODE": "auto",
+    "DEEP_RESEARCH_MAX_DEEPENED_BRANCHES": 1,
+    "DEEP_RESEARCH_MIN_DEEPENING_SCORE": 8,
+    "DEEP_RESEARCH_SOURCE_STANDARDS": True,
+    "DEEP_RESEARCH_DIRECT_URL_SEED": False,
+    # auto uses the fast selector only when deterministic evidence is genuinely
+    # ambiguous; llm and deterministic are immediate rollback modes.
+    "SOURCE_SELECTOR_MODE": "auto",
+    # Job-scoped JSONL trajectories are opt-in for package users. Deployments
+    # can persist them by mounting RESEARCH_TRAJECTORY_DIR.
+    "RESEARCH_TRAJECTORY_ENABLED": False,
+    "RESEARCH_TRAJECTORY_DIR": "data/trajectories",
+    # off and shadow execute the current internal 2/3 ranked/focused policy.
+    # shadow additionally calculates and reports the recommended duration policy.
+    "RESEARCH_DURATION_CONTROLLER_MODE": "off",
+    "RESEARCH_DURATION_DEFAULT_SECONDS": 60,
+    "RESEARCH_DURATION_MIN_SECONDS": 15,
+    "RESEARCH_DURATION_MAX_SECONDS": 600,
+    "RESEARCH_BUDGET_CALIBRATION_ENABLED": True,
+    "RESEARCH_BUDGET_CALIBRATION_MIN_SAMPLES": 10,
+    "DEEP_RESEARCH_ADAPTIVE_COMPRESSION": False,
+    "DEEP_RESEARCH_SIMILARITY_RESCUE_FLOOR": 0.30,
+    "DEEP_RESEARCH_MAX_CONTEXT_CHUNKS": 10,
+    "DEEP_RESEARCH_MAX_CHUNKS_PER_SOURCE": 3,
+    "DEEP_RESEARCH_FALLBACK_CORROBORATION_ENABLED": False,
+    "DEEP_RESEARCH_FALLBACK_CORROBORATION": 2,
     
     # MCP retriever specific settings
     "MCP_SERVERS": [],  # List of predefined MCP server configurations

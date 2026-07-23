@@ -112,6 +112,7 @@ async def generate_sub_queries(
         report_type,
         max_iterations=cfg.max_iterations or 3,
         context=context,
+        evidence_enabled=getattr(cfg, "planning_evidence_enabled", False),
     )
 
     try:

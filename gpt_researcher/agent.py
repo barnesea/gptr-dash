@@ -31,6 +31,8 @@ from .skills.researcher import ResearchConductor
 from .skills.writer import ReportGenerator
 from .utils.enum import ReportSource, ReportType, Tone
 from .utils.llm import create_chat_completion
+from .utils.research_trajectory import ResearchTrajectory
+from .utils.research_budget import ResearchPolicy
 from .vector_store import VectorStoreWrapper
 
 
@@ -80,6 +82,13 @@ class GPTResearcher:
         mcp_configs: list[dict] | None = None,
         mcp_max_iterations: int | None = None,
         mcp_strategy: str | None = None,
+        research_mode: str | None = None,
+        visited_urls_lock: asyncio.Lock | None = None,
+        trajectory: ResearchTrajectory | None = None,
+        trajectory_id: str | None = None,
+        trajectory_node_id: str = "root",
+        trajectory_parent_node_id: str | None = None,
+        research_policy: ResearchPolicy | None = None,
         **kwargs
     ):
         """
@@ -138,8 +147,39 @@ class GPTResearcher:
         self.kwargs = kwargs
         self.query = query
         self.report_type = report_type
+        # DeepResearchSkill uses this explicit mode for leaf research.  It is
+        # intentionally instance-scoped so ordinary GPTResearcher callers keep
+        # their existing planner behavior.
+        self.research_mode = research_mode or "standard"
         self.cfg = Config(config_path)
         self.cfg.set_verbose(verbose)
+        self.research_policy = research_policy
+        self.coverage_ledger: list[dict[str, Any]] = []
+        self._owns_trajectory = False
+        if (
+            trajectory is None
+            and getattr(self.cfg, "research_trajectory_enabled", False)
+            and (report_type == ReportType.DeepResearch.value or trajectory_id)
+        ):
+            trajectory = ResearchTrajectory(
+                query=query,
+                directory=getattr(
+                    self.cfg, "research_trajectory_dir", "data/trajectories"
+                ),
+                job_id=trajectory_id,
+                metadata={
+                    "report_type": report_type,
+                    "research_mode": self.research_mode,
+                    "fast_llm": getattr(self.cfg, "fast_llm", ""),
+                    "smart_llm": getattr(self.cfg, "smart_llm", ""),
+                    "strategic_llm": getattr(self.cfg, "strategic_llm", ""),
+                    "embedding": getattr(self.cfg, "embedding", ""),
+                },
+            )
+            self._owns_trajectory = True
+        self.trajectory = trajectory
+        self.trajectory_node_id = trajectory_node_id
+        self.trajectory_parent_node_id = trajectory_parent_node_id
         self.report_source = report_source if report_source else getattr(self.cfg, 'report_source', None)
         self.report_format = report_format
         self.max_subtopics = max_subtopics
@@ -158,7 +198,10 @@ class GPTResearcher:
         self.role = role
         self.parent_query = parent_query
         self.subtopics = subtopics or []
-        self.visited_urls = visited_urls or set()
+        self.visited_urls = visited_urls if visited_urls is not None else set()
+        self.visited_urls_lock = (
+            visited_urls_lock if visited_urls_lock is not None else asyncio.Lock()
+        )
         self.verbose = verbose
         self.context = context or []
         self.headers = headers or {}
@@ -199,6 +242,28 @@ class GPTResearcher:
 
         # Handle MCP strategy configuration with backwards compatibility
         self.mcp_strategy = self._resolve_mcp_strategy(mcp_strategy, mcp_max_iterations)
+
+    def trace_event(
+        self,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+        *,
+        node_id: str | None = None,
+        parent_node_id: str | None = None,
+    ) -> None:
+        """Record an event on this job's trajectory when enabled."""
+        if self.trajectory is None:
+            return
+        self.trajectory.record(
+            event_type,
+            data or {},
+            node_id=node_id or self.trajectory_node_id,
+            parent_node_id=(
+                self.trajectory_parent_node_id
+                if parent_node_id is None
+                else parent_node_id
+            ),
+        )
     
     def _generate_research_id(self) -> str:
         """Generate a unique research ID for this session.
@@ -414,7 +479,9 @@ class GPTResearcher:
             "type": "deep_research",
             "breadth": self.deep_researcher.breadth,
             "depth": self.deep_researcher.depth,
-            "concurrency": self.deep_researcher.concurrency_limit
+            "concurrency": self.deep_researcher.concurrency_limit,
+            "tree_policy": self.deep_researcher.tree_policy,
+            "branch_mode": self.deep_researcher.branch_mode,
         })
 
         # Log deep research start
@@ -422,7 +489,9 @@ class GPTResearcher:
             "query": self.query,
             "breadth": self.deep_researcher.breadth,
             "depth": self.deep_researcher.depth,
-            "concurrency": self.deep_researcher.concurrency_limit
+            "concurrency": self.deep_researcher.concurrency_limit,
+            "tree_policy": self.deep_researcher.tree_policy,
+            "branch_mode": self.deep_researcher.branch_mode,
         })
 
         # Run deep research and get context

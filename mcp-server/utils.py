@@ -61,11 +61,33 @@ def format_sources_for_response(sources: List[Dict[str, Any]]) -> List[Dict[str,
     return [
         {
             "title": source.get("title", "Unknown"),
-            "url": source.get("url", ""),
-            "content_length": len(source.get("content", ""))
+            "url": source.get("url") or source.get("href", ""),
+            "content_length": len(
+                source.get("raw_content")
+                or source.get("content")
+                or source.get("body")
+                or ""
+            ),
         }
         for source in sources
     ]
+
+
+def source_urls_from_sources(sources: List[Dict[str, Any]]) -> List[str]:
+    """Return verified evidence URLs in stable order.
+
+    ``GPTResearcher.visited_urls`` includes attempted fetches because it doubles
+    as the concurrent deduplication set. MCP responses must instead expose only
+    pages that survived scraping and post-scrape integrity validation.
+    """
+    urls: List[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        url = str(source.get("url") or source.get("href") or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 def format_context_with_sources(topic: str, context: str, sources: List[Dict[str, Any]]) -> str:
@@ -136,4 +158,4 @@ def create_research_prompt(topic: str, goal: str, report_format: str = "research
     - Use the write_report tool with a custom prompt to generate a structured {report_format}
     
     You can also use get_research_sources to view additional details about the information sources.
-    """ 
+    """

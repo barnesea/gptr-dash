@@ -72,6 +72,10 @@ def setup_research_logging():
     
     # Create JSON handler
     json_handler = JSONResearchHandler(json_file)
+    # Backward compatibility for get_json_handler(). New deep-research
+    # trajectories are job-scoped and do not depend on this process-global
+    # attribute, but existing dashboard callers still expect it.
+    research_logger.json_handler = json_handler
     
     return str(log_file), str(json_file), research_logger, json_handler
 

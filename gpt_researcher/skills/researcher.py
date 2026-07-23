@@ -8,14 +8,28 @@ and context gathering.
 import asyncio
 import logging
 import os
-import random
+import time
+
+import json_repair
 
 from ..actions.agent_creator import choose_agent
 from ..actions.query_processing import get_search_results, plan_research_outline
+from ..actions.source_selection import (
+    canonical_source_alternatives,
+    deterministic_select_sources,
+    has_meaningful_query_anchor,
+    parse_model_selection,
+    post_scrape_integrity_reason,
+    should_use_model_selector,
+    source_card,
+    source_quality_tier,
+    source_url,
+)
 from ..actions.utils import stream_output
 from ..document import DocumentLoader, LangChainDocumentLoader, OnlineDocumentLoader
 from ..utils.enum import ReportSource, ReportType
 from ..utils.logging_config import get_json_handler
+from ..utils.llm import create_chat_completion
 
 
 class ResearchConductor:
@@ -46,6 +60,33 @@ class ResearchConductor:
         self._mcp_cache_lock = asyncio.Lock()
         # Track MCP query count for balanced mode
         self._mcp_query_count = 0
+        self.last_retrieval_diagnostics: dict = {
+            "candidate_count": 0,
+            "selected_count": 0,
+            "scraped_count": 0,
+            "integrity_rejected_count": 0,
+            "accepted_count": 0,
+            "compression": {},
+        }
+
+    def _trace(self, event_type: str, data: dict) -> None:
+        trace = getattr(self.researcher, "trace_event", None)
+        if trace:
+            trace(event_type, data)
+
+    def _stage_timing(self, stage: str, duration_seconds: float) -> None:
+        policy = getattr(self.researcher, "research_policy", None)
+        estimates = (
+            getattr(policy, "estimated_stage_seconds", {}) if policy else {}
+        )
+        self._trace(
+            "stage_timing",
+            {
+                "stage": stage,
+                "duration_seconds": round(duration_seconds, 3),
+                "estimated_seconds": float(estimates.get(stage, 0.0)),
+            },
+        )
 
     async def plan_research(self, query, query_domains=None):
         """Gets the sub-queries from the query
@@ -61,14 +102,43 @@ class ResearchConductor:
             self.researcher.websocket,
         )
 
+        evidence_enabled = getattr(self.researcher.cfg, "planning_evidence_enabled", False)
+        planning_result_count = (
+            getattr(self.researcher.cfg, "planning_search_results", 8)
+            if evidence_enabled
+            else self.researcher.cfg.max_search_results_per_query
+        )
         search_results = await get_search_results(
             query,
             self.researcher.retrievers[0],
             query_domains,
             researcher=self.researcher,
-            max_results=self.researcher.cfg.max_search_results_per_query,
+            max_results=planning_result_count,
         )
         self.logger.info(f"Initial search results obtained: {len(search_results)} results")
+        if evidence_enabled:
+            evidence = [
+                source_card(result, index + 1)
+                for index, result in enumerate(search_results)
+                if source_url(result)
+            ]
+            if self.json_handler:
+                self.json_handler.log_event("planning_evidence", {
+                    "query": query,
+                    "results": evidence,
+                })
+            self._trace("planning_evidence", {
+                "query": query,
+                "results": evidence,
+            })
+            await stream_output(
+                "logs",
+                "planning_evidence",
+                f"🧭 Collected {len(evidence)} preliminary result cards for evidence-grounded planning.",
+                self.researcher.websocket,
+                True,
+                evidence,
+            )
 
         await stream_output(
             "logs",
@@ -125,7 +195,9 @@ class ResearchConductor:
                 self.researcher.websocket
             )
 
-        # Choose agent and role if not already defined
+        # Focused deep branches receive their parent role.  Avoid spending a
+        # model request choosing a role for each deliberately narrow leaf.
+        # Choose agent and role if not already defined.
         if not (self.researcher.agent and self.researcher.role):
             self.researcher.agent, self.researcher.role = await choose_agent(
                 query=self.researcher.query,
@@ -191,7 +263,7 @@ class ResearchConductor:
             azure_files = await azure_loader.load()
             document_data = await DocumentLoader(azure_files).load()  # Reuse existing loader
             research_data = await self._get_context_by_web_search(self.researcher.query, document_data)
-            
+
         elif self.researcher.report_source == ReportSource.LangChainDocuments.value:
             langchain_documents_data = await LangChainDocumentLoader(
                 self.researcher.documents
@@ -245,16 +317,102 @@ class ResearchConductor:
         new_search_urls = await self._get_new_urls(urls)
         self.logger.info(f"New URLs to process: {new_search_urls}")
 
-        scraped_content = await self.researcher.scraper_manager.browse_urls(new_search_urls)
+        integrity_enabled = getattr(
+            self.researcher.cfg, "post_scrape_source_integrity", False
+        )
+        scraped_content = await self.researcher.scraper_manager.browse_urls(
+            new_search_urls, record_sources=not integrity_enabled
+        )
+
+        # A selected canonical page may fail while its raw, HTML, or PDF form
+        # remains fetchable. Try only deterministic same-source variants.
+        selected_candidates_by_url = {
+            url: {"url": url} for url in new_search_urls
+        }
+        fetched_urls = {source_url(item) for item in scraped_content}
+        alternate_candidates: dict[str, dict] = {}
+        for url in new_search_urls:
+            if url in fetched_urls:
+                continue
+            original = selected_candidates_by_url.get(url, {"url": url})
+            for alternate in canonical_source_alternatives(url):
+                alternate_candidates[alternate] = {
+                    **original,
+                    "url": alternate,
+                    "href": alternate,
+                }
+        alternate_urls = await self._get_new_urls(list(alternate_candidates))
+        if alternate_urls:
+            selected_candidates_by_url.update(
+                {
+                    url: alternate_candidates[url]
+                    for url in alternate_urls
+                    if url in alternate_candidates
+                }
+            )
+            alternate_content = await self.researcher.scraper_manager.browse_urls(
+                alternate_urls, record_sources=not integrity_enabled
+            )
+            scraped_content.extend(alternate_content)
+            self.last_retrieval_diagnostics["canonical_alternative_attempt_count"] = (
+                len(alternate_urls)
+            )
+            self.last_retrieval_diagnostics["canonical_alternative_success_count"] = (
+                len(alternate_content)
+            )
+            self._trace(
+                "canonical_source_recovery",
+                {
+                    "query": self.researcher.query,
+                    "attempted_urls": alternate_urls,
+                    "accepted_before_integrity": len(alternate_content),
+                },
+            )
+        if integrity_enabled:
+            scraped_content = await self._validate_post_scrape_sources(
+                self.researcher.query,
+                scraped_content,
+                selected_candidates_by_url,
+            )
         self.logger.info(f"Scraped content from {len(scraped_content)} URLs")
+        self._trace("direct_url_retrieval", {
+            "requested_urls": list(urls),
+            "new_urls": new_search_urls,
+            "accepted_count": len(scraped_content),
+        })
 
         if self.researcher.vector_store:
             self.researcher.vector_store.load(scraped_content)
 
-        context = await self.researcher.context_manager.get_similar_content_by_query(
-            self.researcher.query, scraped_content
+        compression_started_at = time.perf_counter()
+        compression = (
+            await self.researcher.context_manager.get_similar_content_with_diagnostics(
+                self.researcher.query, scraped_content
+            )
         )
-        return context
+        self.last_retrieval_diagnostics.update(
+            {
+                "candidate_count": len(urls),
+                "selected_count": len(new_search_urls),
+                "scraped_count": len(scraped_content),
+                "accepted_count": len(scraped_content),
+                "compression": compression.diagnostics(),
+                "compression_duration_seconds": round(
+                    time.perf_counter() - compression_started_at, 3
+                ),
+            }
+        )
+        self._trace(
+            "compression",
+            {
+                "query": self.researcher.query,
+                **compression.diagnostics(),
+            },
+        )
+        self._stage_timing(
+            "compression", time.perf_counter() - compression_started_at
+        )
+        return compression.context
 
     # Add logging to other methods similarly...
 
@@ -357,13 +515,18 @@ class ResearchConductor:
                     self._mcp_results_cache = mcp_context
                     self.logger.info(f"MCP results cached: {len(mcp_context)} total context entries")
 
-        # Generate Sub-Queries including original query
-        sub_queries = await self.plan_research(query, query_domains)
-        self.logger.info(f"Generated sub-queries: {sub_queries}")
-        
-        # If this is not part of a sub researcher, add original query to research for better results
-        if self.researcher.report_type != "subtopic_report":
-            sub_queries.append(query)
+        focused = getattr(self.researcher, "research_mode", "standard") == "deep_branch"
+        if focused:
+            sub_queries = [query]
+            self.logger.info("Focused deep branch: skipping nested query planning for %r", query)
+        else:
+            # Generate Sub-Queries including original query
+            sub_queries = await self.plan_research(query, query_domains)
+            self.logger.info(f"Generated sub-queries: {sub_queries}")
+
+            # If this is not part of a sub researcher, add original query to research for better results
+            if self.researcher.report_type != "subtopic_report":
+                sub_queries.append(query)
 
         if self.researcher.verbose:
             await stream_output(
@@ -512,6 +675,10 @@ class ResearchConductor:
                 "query": sub_query,
                 "scraped_data_size": len(scraped_data)
             })
+        self._trace("sub_query", {
+            "query": sub_query,
+            "scraped_data_size": len(scraped_data),
+        })
         
         if self.researcher.verbose:
             await stream_output(
@@ -597,7 +764,30 @@ class ResearchConductor:
 
             # Get similar content based on scraped data
             if scraped_data:
-                web_context = await self.researcher.context_manager.get_similar_content_by_query(sub_query, scraped_data)
+                compression_started_at = time.perf_counter()
+                compression = (
+                    await self.researcher.context_manager.get_similar_content_with_diagnostics(
+                        sub_query, scraped_data
+                    )
+                )
+                web_context = compression.context
+                self.last_retrieval_diagnostics["compression"] = (
+                    compression.diagnostics()
+                )
+                self.last_retrieval_diagnostics["compression_duration_seconds"] = (
+                    round(time.perf_counter() - compression_started_at, 3)
+                )
+                self._stage_timing(
+                    "compression",
+                    time.perf_counter() - compression_started_at,
+                )
+                self._trace(
+                    "compression",
+                    {
+                        "query": sub_query,
+                        **compression.diagnostics(),
+                    },
+                )
                 self.logger.info(f"Web content found for sub-query: {len(str(web_context)) if web_context else 0} chars")
 
             # Combine MCP context with web context intelligently
@@ -635,6 +825,13 @@ class ResearchConductor:
                     "content_size": len(str(combined_context)),
                     "mcp_sources": len(mcp_context),
                     "web_content": bool(web_context)
+                })
+            if combined_context:
+                self._trace("content_found", {
+                    "sub_query": sub_query,
+                    "content_size": len(str(combined_context)),
+                    "mcp_sources": len(mcp_context),
+                    "web_content": bool(web_context),
                 })
                 
             return combined_context
@@ -805,25 +1002,30 @@ class ResearchConductor:
         """
 
         new_urls = []
-        for url in url_set_input:
-            if url not in self.researcher.visited_urls:
-                self.researcher.visited_urls.add(url)
-                new_urls.append(url)
-                if self.researcher.verbose:
-                    await stream_output(
-                        "logs",
-                        "added_source_url",
-                        f"✅ Added source url to research: {url}\n",
-                        self.researcher.websocket,
-                        True,
-                        url,
-                    )
+        lock = getattr(self.researcher, "visited_urls_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+        async with lock:
+            for url in url_set_input:
+                if url not in self.researcher.visited_urls:
+                    self.researcher.visited_urls.add(url)
+                    new_urls.append(url)
+        for url in new_urls:
+            if self.researcher.verbose:
+                await stream_output(
+                    "logs",
+                    "added_source_url",
+                    f"✅ Added source url to research: {url}\n",
+                    self.researcher.websocket,
+                    True,
+                    url,
+                )
 
         return new_urls
 
     async def _search_relevant_source_urls(self, query, query_domains: list | None = None):
-        new_search_urls = []
-        prefetched_content = []
+        search_started_at = time.perf_counter()
+        candidates = []
         if query_domains is None:
             query_domains = []
 
@@ -839,35 +1041,195 @@ class ResearchConductor:
                 retriever = retriever_class(query, query_domains=query_domains)
 
                 # Perform the search using the current retriever
+                policy = getattr(self.researcher, "research_policy", None)
+                max_results = (
+                    policy.result_cards_per_query
+                    if policy is not None
+                    else self.researcher.cfg.max_search_results_per_query
+                )
                 search_results = await asyncio.to_thread(
-                    retriever.search, max_results=self.researcher.cfg.max_search_results_per_query
+                    retriever.search, max_results=max_results
                 )
 
                 if not search_results:
                     continue
 
-                # Separate results that already have content from those needing scraping
+                # Retain result metadata until source selection has made a decision.
                 for result in search_results:
                     url = result.get("href") or result.get("url")
-                    raw_content = result.get("raw_content")
-                    if url and raw_content and len(raw_content) > 100:
-                        # Only raw_content signals that a retriever already fetched the full page.
-                        # body is snippet-sized text for most web retrievers and still needs scraping.
-                        prefetched_content.append({
-                            "url": url,
-                            "raw_content": raw_content,
-                        })
-                        self.researcher.add_research_sources([{"url": url}])
-                    elif url:
-                        new_search_urls.append(url)
+                    if url:
+                        candidates.append(result)
             except Exception as e:
                 self.logger.error(f"Error searching with {retriever_class.__name__}: {e}")
 
-        # Get unique URLs
-        new_search_urls = await self._get_new_urls(new_search_urls)
-        random.shuffle(new_search_urls)
+        # Preserve first-seen ordering while suppressing duplicate result cards.
+        deduplicated = []
+        seen_urls = set()
+        for candidate in candidates:
+            url = source_url(candidate)
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                deduplicated.append(candidate)
+        self._trace("search_results", {
+            "query": query,
+            "candidate_count": len(candidates),
+            "deduplicated_count": len(deduplicated),
+            "candidates": [
+                source_card(candidate, index + 1)
+                for index, candidate in enumerate(deduplicated)
+            ],
+        })
+        self.last_retrieval_diagnostics["candidate_count"] = len(deduplicated)
+        self.last_retrieval_diagnostics["search_duration_seconds"] = round(
+            time.perf_counter() - search_started_at, 3
+        )
+        self._stage_timing("search", time.perf_counter() - search_started_at)
 
-        return new_search_urls, prefetched_content
+        selected = deduplicated
+        if getattr(self.researcher.cfg, "pre_scrape_source_curation", False) and deduplicated:
+            selected = await self._select_source_candidates(query, deduplicated)
+        self.last_retrieval_diagnostics["selected_count"] = len(selected)
+
+        new_search_urls = []
+        prefetched_content = []
+        selected_candidates_by_url = {}
+        for result in selected:
+            url = source_url(result)
+            selected_candidates_by_url[url] = result
+            raw_content = result.get("raw_content")
+            if raw_content and len(raw_content) > 100:
+                prefetched_content.append({
+                    "url": url,
+                    "raw_content": raw_content,
+                    "title": result.get("title", ""),
+                })
+            else:
+                new_search_urls.append(url)
+
+        new_search_urls = await self._get_new_urls(new_search_urls)
+
+        return new_search_urls, prefetched_content, selected_candidates_by_url
+
+    async def _select_source_candidates(self, query, candidates):
+        """Use the fast model to choose a small, diverse pre-scrape set.
+
+        Invalid output and transient model failures intentionally use the same
+        deterministic fallback so the crawler never falls back to scraping every
+        candidate result.
+        """
+        policy = getattr(self.researcher, "research_policy", None)
+        max_sources = max(
+            1,
+            (
+                policy.scrape_cap_per_query
+                if policy is not None
+                else getattr(
+                    self.researcher.cfg,
+                    "pre_scrape_max_sources_per_query",
+                    3,
+                )
+            ),
+        )
+        strict = (
+            getattr(self.researcher, "research_mode", "standard").startswith("deep_branch")
+            and getattr(self.researcher.cfg, "deep_research_source_standards", False)
+        )
+        mode = str(getattr(self.researcher.cfg, "source_selector_mode", "llm")).lower()
+        cards = [source_card(candidate, index + 1) for index, candidate in enumerate(candidates)]
+        selection_started_at = time.perf_counter()
+        used_fallback = False
+        selector_mode = "deterministic"
+        parsed = None
+        if should_use_model_selector(query, candidates, mode):
+            selector_mode = "llm"
+            try:
+                from ..prompts import PromptFamily
+
+                response = await create_chat_completion(
+                    model=self.researcher.cfg.fast_llm_model,
+                    messages=[{
+                        "role": "user",
+                        "content": PromptFamily.select_search_sources_prompt(query, cards, max_sources),
+                    }],
+                    temperature=0.1,
+                    max_tokens=900,
+                    llm_provider=self.researcher.cfg.fast_llm_provider,
+                    llm_kwargs=self.researcher.cfg.llm_kwargs,
+                    cost_callback=getattr(self.researcher, "add_costs", None),
+                    **getattr(self.researcher, "kwargs", {}),
+                )
+                parsed = parse_model_selection(json_repair.loads(response), candidates, max_sources)
+            except Exception as error:
+                self.logger.warning("Pre-scrape source selection failed: %s", error)
+                parsed = None
+        if parsed is None:
+            used_fallback = True
+            selected, reasons = deterministic_select_sources(query, candidates, max_sources, strict=strict)
+        else:
+            selected, reasons = parsed
+            has_higher_tier = any(
+                source_quality_tier(candidate) in {"primary", "reputable"}
+                and has_meaningful_query_anchor(query, candidate)
+                for candidate in candidates
+            )
+            off_topic = [
+                candidate for candidate in selected
+                if (
+                    not has_meaningful_query_anchor(query, candidate)
+                    or source_quality_tier(candidate) == "reject"
+                    or (strict and source_quality_tier(candidate) == "fallback" and has_higher_tier)
+                )
+            ]
+            if off_topic:
+                selected = [candidate for candidate in selected if candidate not in off_topic]
+                for candidate in off_topic:
+                    reasons[source_url(candidate)] = "rejected by deep source-standard or query-anchor guard"
+                if not selected:
+                    used_fallback = True
+                    selected, fallback_reasons = deterministic_select_sources(query, candidates, max_sources, strict=strict)
+                    reasons.update(fallback_reasons)
+
+        selected_urls = {source_url(candidate) for candidate in selected}
+        selection_event = {
+            "query": query,
+            "policy": getattr(self.researcher.cfg, "source_curation_policy", "balanced"),
+            "selector_mode": selector_mode,
+            "strict_standards": strict,
+            "fallback": used_fallback,
+            "duration_ms": round((time.perf_counter() - selection_started_at) * 1000, 1),
+            "candidate_count": len(candidates),
+            "selected_count": len(selected),
+            "candidates": cards,
+            "selected": [
+                {"url": source_url(candidate), "tier": source_quality_tier(candidate), "reason": reasons.get(source_url(candidate), "selected")}
+                for candidate in selected
+            ],
+            "selected_urls": [source_url(candidate) for candidate in selected],
+            "rejected": [
+                {"url": source_url(candidate), "tier": source_quality_tier(candidate), "reason": reasons.get(source_url(candidate), "not selected")}
+                for candidate in candidates
+                if source_url(candidate) not in selected_urls
+            ],
+        }
+        self.last_retrieval_diagnostics["selector_mode"] = selector_mode
+        self.last_retrieval_diagnostics["selection_duration_seconds"] = round(
+            time.perf_counter() - selection_started_at, 3
+        )
+        self._stage_timing(
+            "selection", time.perf_counter() - selection_started_at
+        )
+        if self.json_handler:
+            self.json_handler.log_event("source_selection", selection_event)
+        self._trace("source_selection", selection_event)
+        await stream_output(
+            "logs",
+            "source_selection",
+            f"🏅 Selected {len(selected)}/{len(candidates)} balanced web sources before scraping.",
+            self.researcher.websocket,
+            True,
+            selection_event,
+        )
+        return selected
 
     async def _scrape_data_by_urls(self, sub_query, query_domains: list | None = None):
         """
@@ -884,7 +1246,10 @@ class ResearchConductor:
         if query_domains is None:
             query_domains = []
 
-        new_search_urls, prefetched_content = await self._search_relevant_source_urls(sub_query, query_domains)
+        new_search_urls, prefetched_content, selected_candidates_by_url = await self._search_relevant_source_urls(
+            sub_query, query_domains
+        )
+        scrape_stage_started_at = time.perf_counter()
 
         # Log the research process if verbose mode is on
         if self.researcher.verbose:
@@ -896,15 +1261,115 @@ class ResearchConductor:
             )
 
         # Scrape URLs that need fetching (skip those already provided by retrievers)
-        scraped_content = await self.researcher.scraper_manager.browse_urls(new_search_urls)
+        integrity_enabled = getattr(self.researcher.cfg, "post_scrape_source_integrity", False)
+        scraped_content = await self.researcher.scraper_manager.browse_urls(
+            new_search_urls, record_sources=not integrity_enabled
+        )
+
+        fetched_urls = {source_url(item) for item in scraped_content}
+        alternate_candidates: dict[str, dict] = {}
+        for url in new_search_urls:
+            if url in fetched_urls:
+                continue
+            original = selected_candidates_by_url.get(url, {"url": url})
+            for alternate in canonical_source_alternatives(url):
+                alternate_candidates[alternate] = {
+                    **original,
+                    "url": alternate,
+                    "href": alternate,
+                }
+        alternate_urls = await self._get_new_urls(list(alternate_candidates))
+        if alternate_urls:
+            selected_candidates_by_url.update(
+                {
+                    url: alternate_candidates[url]
+                    for url in alternate_urls
+                    if url in alternate_candidates
+                }
+            )
+            alternate_content = await self.researcher.scraper_manager.browse_urls(
+                alternate_urls, record_sources=not integrity_enabled
+            )
+            scraped_content.extend(alternate_content)
+            self.last_retrieval_diagnostics[
+                "canonical_alternative_attempt_count"
+            ] = len(alternate_urls)
+            self.last_retrieval_diagnostics[
+                "canonical_alternative_success_count"
+            ] = len(alternate_content)
+            self._trace(
+                "canonical_source_recovery",
+                {
+                    "query": sub_query,
+                    "attempted_urls": alternate_urls,
+                    "accepted_before_integrity": len(alternate_content),
+                },
+            )
 
         # Merge pre-fetched content from retrievers that already provide full text
         scraped_content.extend(prefetched_content)
+        self.last_retrieval_diagnostics["scraped_count"] = len(scraped_content)
+
+        if integrity_enabled:
+            scraped_content = await self._validate_post_scrape_sources(
+                sub_query, scraped_content, selected_candidates_by_url
+            )
+        self.last_retrieval_diagnostics["accepted_count"] = len(scraped_content)
+        self.last_retrieval_diagnostics["scrape_duration_seconds"] = round(
+            time.perf_counter() - scrape_stage_started_at, 3
+        )
+        self._stage_timing(
+            "scraping", time.perf_counter() - scrape_stage_started_at
+        )
 
         if self.researcher.vector_store:
             self.researcher.vector_store.load(scraped_content)
 
         return scraped_content
+
+    async def _validate_post_scrape_sources(self, query, scraped_content, selected_candidates_by_url):
+        """Keep only fetched pages that still match the selected evidence card."""
+        accepted = []
+        rejected = []
+        for item in scraped_content:
+            url = source_url(item)
+            reason = post_scrape_integrity_reason(
+                query, selected_candidates_by_url.get(url), item
+            )
+            if reason:
+                rejected.append({"url": url, "reason": reason})
+            else:
+                accepted.append(item)
+
+        # Unlike the legacy browser path, only verified pages are exposed in
+        # get_research_sources() and therefore to the final report writer.
+        self.researcher.add_research_sources(accepted)
+        event = {
+            "query": query,
+            "accepted_count": len(accepted),
+            "rejected_count": len(rejected),
+            "rejected": rejected,
+        }
+        self.last_retrieval_diagnostics["integrity_rejected_count"] = len(
+            rejected
+        )
+        if self.json_handler:
+            self.json_handler.log_event("post_scrape_source_integrity", event)
+        self._trace("post_scrape_source_integrity", event)
+        if rejected:
+            self.logger.info(
+                "Post-scrape integrity accepted %s/%s pages for query %r",
+                len(accepted), len(scraped_content), query,
+            )
+        await stream_output(
+            "logs",
+            "post_scrape_source_integrity",
+            f"🛡️ Verified {len(accepted)}/{len(scraped_content)} fetched pages before using them as evidence.",
+            self.researcher.websocket,
+            True,
+            event,
+        )
+        return accepted
 
     async def _search(self, retriever, query):
         """
@@ -1018,8 +1483,9 @@ class ResearchConductor:
         if not urls:
             return []
             
-        # Make sure we don't visit URLs we've already visited
-        new_urls = [url for url in urls if url not in self.researcher.visited_urls]
+        # Reserve new URLs under the tree-wide lock before scraping so
+        # concurrent branches cannot fetch the same page.
+        new_urls = await self._get_new_urls(urls)
         
         # Return empty if no new URLs
         if not new_urls:
@@ -1027,9 +1493,6 @@ class ResearchConductor:
             
         # Scrape the content from the URLs
         scraped_content = await self.researcher.scraper_manager.browse_urls(new_urls)
-        
-        # Add the URLs to visited_urls
-        self.researcher.visited_urls.update(new_urls)
         
         return scraped_content
         
@@ -1079,4 +1542,3 @@ class ResearchConductor:
                     "progress": progress
                 }
             )
-

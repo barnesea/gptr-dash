@@ -113,6 +113,8 @@ class Config:
         if not model:
             return
 
+        model = self._prefer_llama_swap_alias(model, base_url, config)
+
         for key in needs_default:
             config[key] = f"openai:{model}"
 
@@ -135,6 +137,53 @@ class Config:
             return None, base_url
 
         return cls._extract_llama_swap_model(payload), base_url
+
+    @classmethod
+    def _prefer_llama_swap_alias(
+        cls, model: str, base_url: str, config: Dict[str, Any]
+    ) -> str:
+        """Prefer the opt-in GPT Researcher alias when llama-swap advertises it.
+
+        The suffix is intentionally disabled unless the deployment sets it. This
+        keeps the generic GPT Researcher configuration compatible with ordinary
+        llama-swap installations while allowing a homelab to opt in with, for
+        example, ``GPTR_LLAMA_SWAP_ALIAS_SUFFIX=gptr``.
+        """
+        suffix = os.getenv("GPTR_LLAMA_SWAP_ALIAS_SUFFIX", "").strip().lstrip(":")
+        if not suffix or model.endswith(f":{suffix}"):
+            return model
+
+        timeout = float(os.getenv("LLAMA_SWAP_TIMEOUT") or config.get("LLAMA_SWAP_TIMEOUT", 1.0))
+        candidate = f"{model}:{suffix}"
+        if candidate in cls._get_llama_swap_model_ids(base_url, timeout):
+            return candidate
+        return model
+
+    @staticmethod
+    def _get_llama_swap_model_ids(base_url: str, timeout: float) -> set[str]:
+        """Return the model IDs advertised by llama-swap's OpenAI endpoint."""
+        models_url = f"{base_url.rstrip('/')}/v1/models"
+        try:
+            with urllib.request.urlopen(models_url, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+            return set()
+
+        entries = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(entries, list):
+            return set()
+
+        model_ids: set[str] = set()
+        for entry in entries:
+            if isinstance(entry, str) and entry.strip():
+                model_ids.add(entry.strip())
+            elif isinstance(entry, dict):
+                for key in ("id", "model", "name"):
+                    value = entry.get(key)
+                    if isinstance(value, str) and value.strip():
+                        model_ids.add(value.strip())
+                        break
+        return model_ids
 
     @staticmethod
     def _llama_swap_urls(url: str) -> tuple[str, str]:

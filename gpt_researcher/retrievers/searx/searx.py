@@ -83,6 +83,9 @@ class SearxSearch():
             search_response.append({
                 "href": href,
                 "body": result.get('content') or result.get('snippet') or '',
+                "title": result.get('title') or '',
+                "engine": result.get('engine') or result.get('engines') or '',
+                "date": result.get('publishedDate') or result.get('published_date') or result.get('date') or '',
             })
             if len(search_response) >= max_results:
                 break

@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Set
 
 from ..actions.utils import stream_output
 from ..context.compression import (
+    CompressionResult,
     ContextCompressor,
     VectorstoreCompressor,
     WrittenContentCompressor,
@@ -61,6 +62,62 @@ class ContextManager:
         )
         return await context_compressor.async_get_context(
             query=query, max_results=10, cost_callback=self.researcher.add_costs
+        )
+
+    async def get_similar_content_with_diagnostics(
+        self, query: str, pages: list
+    ) -> CompressionResult:
+        """Compress a deep branch while retaining score and rescue telemetry."""
+        context_compressor = ContextCompressor(
+            documents=pages,
+            embeddings=self.researcher.memory.get_embeddings(),
+            similarity_threshold=getattr(
+                self.researcher.cfg, "similarity_threshold", None
+            ),
+            prompt_family=self.researcher.prompt_family,
+            **self.researcher.kwargs,
+        )
+        deep_branch = getattr(self.researcher, "research_mode", "").startswith(
+            "deep_branch"
+        )
+        return await context_compressor.async_get_context_with_diagnostics(
+            query,
+            max_results=max(
+                1,
+                int(
+                    getattr(
+                        self.researcher.cfg,
+                        "deep_research_max_context_chunks",
+                        10,
+                    )
+                ),
+            ),
+            cost_callback=self.researcher.add_costs,
+            adaptive=(
+                deep_branch
+                and getattr(
+                    self.researcher.cfg,
+                    "deep_research_adaptive_compression",
+                    False,
+                )
+            ),
+            rescue_floor=float(
+                getattr(
+                    self.researcher.cfg,
+                    "deep_research_similarity_rescue_floor",
+                    0.30,
+                )
+            ),
+            max_chunks_per_source=max(
+                1,
+                int(
+                    getattr(
+                        self.researcher.cfg,
+                        "deep_research_max_chunks_per_source",
+                        3,
+                    )
+                ),
+            ),
         )
 
     async def get_similar_content_by_query_with_vectorstore(self, query: str, filter: dict | None) -> str:
