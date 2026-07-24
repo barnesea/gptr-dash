@@ -1085,7 +1085,8 @@ enough."""
                 primary_sources = [
                     source
                     for source in donor.get("sources") or []
-                    if source_quality_tier(source) in {"primary", "reputable"}
+                    if source_quality_tier(source, query)
+                    in {"primary", "reputable"}
                     and has_meaningful_query_anchor(query, source)
                 ]
                 donor_context = str(donor.get("context") or "").strip()
@@ -1115,6 +1116,68 @@ enough."""
             reused_context = "\n\n".join(
                 trim_context_to_word_limit(reused_contexts)
             )
+            reuse_diagnostics = {
+                **(result.get("retrieval_diagnostics") or {}),
+                "accepted_count": len(unique_sources),
+                "scraped_count": max(
+                    len(unique_sources),
+                    int(
+                        (result.get("retrieval_diagnostics") or {}).get(
+                            "scraped_count"
+                        )
+                        or 0
+                    ),
+                ),
+                "selected_count": max(
+                    len(unique_sources),
+                    int(
+                        (result.get("retrieval_diagnostics") or {}).get(
+                            "selected_count"
+                        )
+                        or 0
+                    ),
+                ),
+                "candidate_count": max(
+                    len(unique_sources),
+                    int(
+                        (result.get("retrieval_diagnostics") or {}).get(
+                            "candidate_count"
+                        )
+                        or 0
+                    ),
+                ),
+                "cross_aspect_reuse": True,
+                "reused_source_count": len(unique_sources),
+            }
+            reuse_state, reuse_details = self._coverage_state(
+                reused_context,
+                unique_sources,
+                reuse_diagnostics,
+                aspect=result.get("aspect"),
+            )
+            if reuse_state != "evidence_ready":
+                self._emit_event(
+                    "coverage_reuse",
+                    {
+                        "aspect_id": (result.get("aspect") or {}).get("id"),
+                        "query": query,
+                        "source_urls": sorted(seen_urls),
+                        "source_count": len(unique_sources),
+                        "state": "rejected",
+                        "coverage_state": reuse_state,
+                        "missing_scope_anchors": reuse_details.get(
+                            "missing_scope_anchors", []
+                        ),
+                        "reason": (
+                            "cross-aspect evidence did not satisfy the "
+                            "assigned scope"
+                        ),
+                    },
+                    node_id=result.get("node_id", node_id),
+                    parent_node_id=node_id,
+                )
+                recovered.append(result)
+                continue
             processed = await self.process_research_results(
                 query=query,
                 context=reused_context,
@@ -1124,10 +1187,6 @@ enough."""
                 for learning, citation in processed["citations"].items()
                 if citation in seen_urls
             }
-            tiers = {"primary": 0, "reputable": 0, "fallback": 0, "reject": 0}
-            for source in unique_sources:
-                tier = source_quality_tier(source)
-                tiers[tier] = tiers.get(tier, 0) + 1
             replacement = {
                 **result,
                 "learnings": processed["learnings"],
@@ -1136,16 +1195,11 @@ enough."""
                 "context": reused_context,
                 "sources": unique_sources,
                 "attempted_sources": unique_sources,
-                "coverage_state": "evidence_ready",
-                "source_tiers": tiers,
-                "corroborated": False,
+                "attempted_context": reused_context,
+                "coverage_state": reuse_state,
+                **reuse_details,
                 "recovery_reason": "reused verified cross-aspect evidence",
-                "retrieval_diagnostics": {
-                    **(result.get("retrieval_diagnostics") or {}),
-                    "accepted_count": len(unique_sources),
-                    "cross_aspect_reuse": True,
-                    "reused_source_count": len(unique_sources),
-                },
+                "retrieval_diagnostics": reuse_diagnostics,
             }
             self._emit_event(
                 "coverage_reuse",
@@ -2459,8 +2513,9 @@ enough."""
                 "Explicitly state unresolved gaps; never resolve them from model "
                 "knowledge. Do not call fallback sources primary, generalize "
                 "beyond matched scope anchors, or classify diseases, parasites, "
-                "or environmental hazards as predators unless verified evidence "
-                "explicitly supports that category."
+                "microbes, or environmental hazards as predators. Describe "
+                "defenses as reducing vulnerability or predation risk; never "
+                "call an animal immune to predators."
             )
 
         # Trim final context to word limit

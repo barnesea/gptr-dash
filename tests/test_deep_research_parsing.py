@@ -324,6 +324,51 @@ async def test_missing_aspect_reuses_verified_primary_evidence(monkeypatch):
     assert recovered[1]["retrieval_diagnostics"]["cross_aspect_reuse"] is True
 
 
+@pytest.mark.asyncio
+async def test_cross_aspect_reuse_cannot_resolve_different_taxon_scope():
+    skill = make_skill()
+    sea_source = {
+        "url": "https://www.seaturtlestatus.org/articles/predators",
+        "title": "Sea turtle predators",
+        "raw_content": "Sea turtles are preyed on by sharks.",
+    }
+    results = [
+        {
+            "node_id": "root.1",
+            "query": "sea turtle predators",
+            "coverage_state": "evidence_ready",
+            "context": "Sea turtles are preyed on by sharks.",
+            "sources": [sea_source],
+        },
+        {
+            "node_id": "root.2",
+            "query": "freshwater and terrestrial turtle predators",
+            "aspect": {
+                "id": "aspect-2",
+                "required_scope_anchors": [
+                    "freshwater turtles",
+                    "terrestrial turtles",
+                ],
+            },
+            "coverage_state": "scrape_failure",
+            "context": "",
+            "sources": [],
+            "retrieval_diagnostics": {
+                "candidate_count": 1,
+                "selected_count": 1,
+            },
+        },
+    ]
+
+    recovered = await skill._reuse_cross_aspect_evidence(
+        results,
+        node_id="root",
+    )
+
+    assert recovered[1]["coverage_state"] == "scrape_failure"
+    assert recovered[1]["sources"] == []
+
+
 @pytest.mark.parametrize(
     ("diagnostics", "context", "sources", "expected"),
     [

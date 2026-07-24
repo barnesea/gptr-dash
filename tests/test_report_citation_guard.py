@@ -91,3 +91,18 @@ def test_report_quality_guard_separates_disease_from_predators():
         query="What are turtle predators?",
     )
     assert diagnostics["category_error"]
+
+
+def test_report_quality_guard_rejects_microbes_and_predator_immunity():
+    url = "https://example.test/turtles"
+    report = (
+        "Microbes are important turtle predators. Adult turtles are immune "
+        f"to predators because of their shells. ([source]({url}))"
+    )
+    diagnostics = report_quality_diagnostics(
+        report,
+        [{"aspect_id": "predators", "state": "evidence_ready"}],
+        query="What are turtle predators?",
+    )
+    assert diagnostics["category_error"]
+    assert diagnostics["predator_immunity_overclaim"]

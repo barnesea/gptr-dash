@@ -171,16 +171,23 @@ def report_quality_diagnostics(
                     unsupported_scope_claims.append(str(anchor))
                     break
     category_error = False
+    predator_immunity_overclaim = False
     if re.search(r"\bpredators?\b", query, re.IGNORECASE):
         category_error = any(
             re.search(
-                r"\b(?:disease|parasite|pathogen|pollution|bycatch|plastic|"
+                r"\b(?:disease|parasite|pathogen|microb|pollution|bycatch|plastic|"
                 r"climate|temperature|storm)\w*\b|\bhabitat loss\b",
                 sentence,
             )
             and re.search(r"\b(?:predator|predation|prey)\w*\b", sentence)
             and not re.search(r"\b(?:not|separate|distinct|unlike)\b", sentence)
             for sentence in re.split(r"(?<=[.!?])\s+", body_lower)
+        )
+        predator_immunity_overclaim = bool(
+            re.search(
+                r"\b(?:immune|immunity)\s+(?:to|from|against)\s+predat",
+                body_lower,
+            )
         )
     issues = []
     if references_only:
@@ -199,7 +206,14 @@ def report_quality_diagnostics(
             + ", ".join(sorted(set(unsupported_scope_claims)))
         )
     if category_error:
-        issues.append("report may classify disease or parasites as predators")
+        issues.append(
+            "report may classify disease, parasites, microbes, or "
+            "environmental hazards as predators"
+        )
+    if predator_immunity_overclaim:
+        issues.append(
+            "report overstates a defense as immunity to predators"
+        )
     return {
         "passes": not issues,
         "issues": issues,
@@ -213,6 +227,7 @@ def report_quality_diagnostics(
         "unsupported_primary_claim": unsupported_primary,
         "unsupported_scope_claims": sorted(set(unsupported_scope_claims)),
         "category_error": category_error,
+        "predator_immunity_overclaim": predator_immunity_overclaim,
     }
 
 
@@ -241,9 +256,9 @@ Rules:
 - State unresolved scope as an explicit evidence limitation.
 - Do not call fallback sources primary.
 - Do not generalize beyond matched scope anchors.
-- Keep diseases, parasites, and environmental hazards separate from predators
-  unless the supplied report already contains explicit verified evidence for
-  that classification.
+- Keep diseases, parasites, microbes, and environmental hazards separate from
+  predators. Describe defenses as reducing vulnerability or predation risk;
+  never call an animal immune to predators.
 - Put an inline Markdown citation at the end of every substantive evidence
   paragraph, using only exact URLs from the allowlist.
 - Return only the corrected Markdown report.
@@ -583,8 +598,9 @@ Evidence-safety requirements:
 - Never call fallback evidence primary evidence.
 - Do not generalize beyond matched_scope_anchors.
 - Do not claim the report is comprehensive when any aspect is unresolved.
-- Keep diseases, parasites, and environmental hazards separate from predators
-  unless verified evidence explicitly supports that classification.
+- Keep diseases, parasites, microbes, and environmental hazards separate from
+  predators. Describe defenses as reducing vulnerability or predation risk;
+  never call an animal immune to predators.
 - Every substantive evidence paragraph must end with an inline citation.
 """
     
