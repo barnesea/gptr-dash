@@ -22,6 +22,10 @@ INLINE_LINK_PATTERN = re.compile(
     r"(?<!!)\[[^\]]+\]\(https?://[^)\s]+\)",
     re.IGNORECASE,
 )
+BARE_URL_PATTERN = re.compile(
+    r"(?<!\()https?://[^\s<>\])]+",
+    re.IGNORECASE,
+)
 
 
 def _normalized_citation_url(url: str) -> str:
@@ -69,6 +73,24 @@ def enforce_verified_citation_urls(
     # hallucinated reference entries cannot survive a regex-only cleanup.
     body = REFERENCE_HEADING_PATTERN.split(report or "", maxsplit=1)[0].rstrip()
     body = MARKDOWN_LINK_PATTERN.sub(replace_link, body)
+    stored_links: list[str] = []
+
+    def store_link(match: re.Match[str]) -> str:
+        stored_links.append(match.group(0))
+        return f"__GPTR_VERIFIED_LINK_{len(stored_links) - 1}__"
+
+    body = MARKDOWN_LINK_PATTERN.sub(store_link, body)
+
+    def replace_bare_url(match: re.Match[str]) -> str:
+        url = match.group(0).rstrip(".,:;!?")
+        normalized = _normalized_citation_url(url)
+        if normalized in allowed:
+            return f"[source]({allowed[normalized]})"
+        return ""
+
+    body = BARE_URL_PATTERN.sub(replace_bare_url, body)
+    for index, link in enumerate(stored_links):
+        body = body.replace(f"__GPTR_VERIFIED_LINK_{index}__", link)
     if not allowed:
         return body
     references = "\n".join(

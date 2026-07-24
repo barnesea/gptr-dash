@@ -40,6 +40,21 @@ def test_report_citation_guard_strips_all_links_without_verified_sources():
     assert "## References" not in guarded
 
 
+def test_report_citation_guard_handles_bare_urls():
+    verified = "https://research.fs.usda.gov/download/treesearch/68855.pdf"
+    guarded = enforce_verified_citation_urls(
+        (
+            f"Supported source: {verified}\n"
+            "Unsupported source: https://example.test/speculation"
+        ),
+        [verified],
+    )
+
+    assert "https://example.test/speculation" not in guarded
+    assert f"[source]({verified})" in guarded
+    assert report_citation_urls(guarded) == {verified}
+
+
 def test_report_quality_guard_detects_references_only_and_scope_overclaim():
     url = "https://www.fisheries.noaa.gov/species/green-turtle"
     report = f"""# Turtle predators

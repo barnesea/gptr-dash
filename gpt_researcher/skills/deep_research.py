@@ -275,6 +275,19 @@ def parse_aspect_plan_response(
         validated_scope_anchors = []
         for value in scope_anchors:
             anchor = str(value).strip()
+            normalized_anchor = " ".join(anchor.lower().split())
+            if (
+                "life stage" in normalized_anchor
+                or normalized_anchor.endswith(
+                    (
+                        " environment",
+                        " environments",
+                        " habitat",
+                        " habitats",
+                    )
+                )
+            ):
+                continue
             anchor_tokens = scope_tokens(anchor)
             if anchor and anchor_tokens and (
                 anchor_tokens & claimed_scope_tokens
@@ -846,6 +859,8 @@ Requirements:
 - Name the specific evidence needed for each aspect rather than copying a generic list.
 - List every taxon, product, version, or region that the aspect claims to cover
   in required_scope_anchors. Leave it empty for a single indivisible subject.
+- Do not put life stages, habitats, evidence types, or generic environments in
+  required_scope_anchors. Describe those as evidence dimensions instead.
 - Scope anchors describe categories claimed by the aspect question. Never list
   anticipated answers or preliminary-result examples (such as particular
   predator species) as required scope anchors.

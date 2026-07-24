@@ -129,6 +129,21 @@ class ReportGenerator:
             getattr(self.researcher, "coverage_ledger", []) or []
         )
         report_params["coverage_ledger"] = coverage_ledger
+        if coverage_ledger and not verified_source_urls:
+            unresolved = [
+                str(item.get("aspect_id") or "unknown")
+                for item in coverage_ledger
+                if item.get("state") != "evidence_ready"
+            ]
+            unresolved_text = ", ".join(unresolved) or "all planned aspects"
+            return (
+                "# Evidence limitation\n\n"
+                "No research aspect produced synthesis-eligible verified "
+                "evidence. Retrieved pages either failed the requested scope "
+                "or evidence-integrity requirements, so no factual report was "
+                "generated from them.\n\n"
+                f"Unresolved coverage: {unresolved_text}."
+            )
 
         if self.researcher.report_type == "subtopic_report":
             report_params.update({

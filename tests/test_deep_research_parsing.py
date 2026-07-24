@@ -56,6 +56,26 @@ def test_aspect_plan_preserves_required_scope_anchors():
     ]
 
 
+def test_aspect_plan_excludes_generic_dimensions_from_scope_anchors():
+    response = """{"aspects":[{
+      "id":"taxa","priority":1,
+      "question":"Which predators affect sea turtles across life stages and marine environments?",
+      "search_query":"sea turtle predators life stages marine environment",
+      "entities_versions_dates":[],
+      "expected_evidence_type":"scholarly evidence",
+      "original_query_anchors":["turtles","predators"],
+      "required_scope_anchors":["sea turtles","life stages","marine environment","nesting habitat"]
+    }]}"""
+
+    plan = parse_aspect_plan_response(
+        response,
+        1,
+        "What are the natural predators of turtles?",
+    )
+
+    assert plan[0]["required_scope_anchors"] == ["sea turtles"]
+
+
 def test_single_fallback_domain_remains_a_gap_but_two_are_usable():
     skill = make_skill()
     skill.researcher.cfg.deep_research_fallback_corroboration_enabled = True
