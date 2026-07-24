@@ -26,10 +26,31 @@ from .validators import Subtopics
 
 def _is_non_retryable_llm_error(exc: Exception) -> bool:
     message = str(exc).lower()
+    if "upstream command exited prematurely" in message:
+        return True
     non_retryable_statuses = ("400", "401", "403", "404", "405", "422")
     if any(status in message for status in non_retryable_statuses):
         return "429" not in message
     return False
+
+
+def _llama_swap_runtime_fallback_model(
+    model: str,
+    llm_provider: str | None,
+    exc: Exception,
+) -> str | None:
+    """Strip the configured alias once when llama-swap loses its route."""
+    suffix = os.getenv("GPTR_LLAMA_SWAP_ALIAS_SUFFIX", "").strip().lstrip(":")
+    message = str(exc).lower()
+    marker = f":{suffix}" if suffix else ""
+    if (
+        llm_provider == "openai"
+        and marker
+        and model.endswith(marker)
+        and "no router for requested model" in message
+    ):
+        return model[: -len(marker)]
+    return None
 
 
 def get_llm(llm_provider: str, **kwargs):
@@ -117,6 +138,7 @@ async def create_chat_completion(
     # create response
     max_attempts = 1 if (stream and websocket is not None) else 10
     last_exception: Exception | None = None
+    alias_fallback_used = False
     for attempt in range(1, max_attempts + 1):
         try:
             response = await provider.get_chat_response(
@@ -124,6 +146,26 @@ async def create_chat_completion(
             )
         except Exception as exc:
             last_exception = exc
+            fallback_model = (
+                None
+                if alias_fallback_used
+                else _llama_swap_runtime_fallback_model(
+                    model,
+                    llm_provider,
+                    exc,
+                )
+            )
+            if fallback_model:
+                logging.getLogger(__name__).warning(
+                    "llama-swap alias route is unavailable; retrying once "
+                    "with base model %s",
+                    fallback_model,
+                )
+                alias_fallback_used = True
+                model = fallback_model
+                provider_kwargs["model"] = fallback_model
+                provider = get_llm(llm_provider, **provider_kwargs)
+                continue
             logging.getLogger(__name__).warning(
                 f"LLM request failed (attempt {attempt}/{max_attempts}): {exc}"
             )

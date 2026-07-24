@@ -695,24 +695,24 @@ Return ONLY a JSON object using this exact schema:
         suffixes = [
             ("Direct answer and core claims", "", "primary or official source"),
             (
-                "Architecture and implementation",
-                "technical architecture implementation official documentation",
-                "official documentation or primary technical publication",
+                "Distinct subgroups, settings, or cases",
+                "major subgroups settings primary scholarly evidence",
+                "primary, official, or scholarly evidence",
             ),
             (
-                "Independent evaluation and limitations",
-                "independent evaluation limitations benchmarks",
-                "reputable independent technical evaluation",
+                "Independent corroboration and limitations",
+                "independent corroboration limitations evidence",
+                "reputable independent evidence",
             ),
             (
                 "Versions and recent changes",
-                "versions release notes recent changes",
-                "official release notes or dated primary source",
+                "recent changes dated primary sources",
+                "dated primary or official source",
             ),
             (
-                "Operational and security considerations",
-                "operational security limitations deployment",
-                "official guidance or reputable technical publication",
+                "Consequences and practical implications",
+                "effects implications primary evidence",
+                "primary evidence or reputable expert guidance",
             ),
             (
                 "Alternatives and tradeoffs",

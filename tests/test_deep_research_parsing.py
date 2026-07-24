@@ -198,6 +198,16 @@ def test_aspect_query_encodes_expected_primary_evidence_standard():
     assert "official documentation" not in query
 
 
+def test_fallback_aspect_plan_is_domain_neutral():
+    plan = DeepResearchSkill._fallback_aspect_plan(
+        "What are the natural predators of turtles?",
+        2,
+    )
+    assert len(plan) == 2
+    assert "technical architecture" not in plan[1]["search_query"]
+    assert "major subgroups" in plan[1]["search_query"]
+
+
 def test_aspect_plan_removes_meta_language_and_rejects_search_operators():
     response = """{"aspects":[
       {"id":"a","priority":1,"question":"How are embedding models trained?","search_query":"embedding model training original query","entities_versions_dates":[],"expected_evidence_type":"primary paper","original_query_anchors":["embedding"]},
