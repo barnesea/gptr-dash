@@ -76,6 +76,11 @@ DEFAULT_CONFIG: BaseConfig = {
     "RESEARCH_DURATION_MAX_SECONDS": 600,
     "RESEARCH_BUDGET_CALIBRATION_ENABLED": True,
     "RESEARCH_BUDGET_CALIBRATION_MIN_SAMPLES": 10,
+    # Remote PDFs are a common source of long-tail latency. These limits apply
+    # to deep-research branches; ordinary browsing keeps the scraper defaults.
+    "DEEP_RESEARCH_PDF_CONNECT_TIMEOUT_SECONDS": 3.0,
+    "DEEP_RESEARCH_PDF_TOTAL_TIMEOUT_SECONDS": 8.0,
+    "DEEP_RESEARCH_PDF_MAX_BYTES": 32 * 1024 * 1024,
     "DEEP_RESEARCH_ADAPTIVE_COMPRESSION": False,
     "DEEP_RESEARCH_SIMILARITY_RESCUE_FLOOR": 0.30,
     "DEEP_RESEARCH_MAX_CONTEXT_CHUNKS": 10,

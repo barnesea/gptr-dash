@@ -15,8 +15,11 @@ from ..actions import (
     write_report_introduction,
 )
 from ..actions.report_generation import (
+    add_visible_evidence_limitation,
     enforce_verified_citation_urls,
+    repair_report_evidence_safety,
     report_citation_urls,
+    report_quality_diagnostics,
 )
 from ..utils.llm import construct_subtopics
 
@@ -122,6 +125,10 @@ class ReportGenerator:
             )
         )
         report_params["verified_source_urls"] = verified_source_urls
+        coverage_ledger = list(
+            getattr(self.researcher, "coverage_ledger", []) or []
+        )
+        report_params["coverage_ledger"] = coverage_ledger
 
         if self.researcher.report_type == "subtopic_report":
             report_params.update({
@@ -139,6 +146,46 @@ class ReportGenerator:
             report,
             verified_source_urls,
         )
+        quality_before = (
+            report_quality_diagnostics(
+                report,
+                coverage_ledger,
+                query=self.researcher.query,
+            )
+            if coverage_ledger
+            else {"passes": True, "issues": []}
+        )
+        correction_used = False
+        if not quality_before["passes"]:
+            try:
+                corrected = await repair_report_evidence_safety(
+                    report=report,
+                    query=self.researcher.query,
+                    coverage_ledger=coverage_ledger,
+                    verified_source_urls=verified_source_urls,
+                    diagnostics=quality_before,
+                    cfg=self.researcher.cfg,
+                    cost_callback=self.researcher.add_costs,
+                    **self.researcher.kwargs,
+                )
+                report = enforce_verified_citation_urls(
+                    corrected,
+                    verified_source_urls,
+                )
+                correction_used = True
+            except Exception:
+                correction_used = False
+        quality_after = (
+            report_quality_diagnostics(
+                report,
+                coverage_ledger,
+                query=self.researcher.query,
+            )
+            if coverage_ledger
+            else quality_before
+        )
+        if not quality_after["passes"]:
+            report = add_visible_evidence_limitation(report, quality_after)
         citations_after = report_citation_urls(report)
         trace = getattr(self.researcher, "trace_event", None)
         if trace:
@@ -159,6 +206,15 @@ class ReportGenerator:
                         )
                         for citation in citations_after
                     ),
+                },
+            )
+            trace(
+                "report_quality_guard",
+                {
+                    "before": quality_before,
+                    "after": quality_after,
+                    "correction_used": correction_used,
+                    "visible_limitation_added": not quality_after["passes"],
                 },
             )
 

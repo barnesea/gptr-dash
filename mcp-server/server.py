@@ -30,6 +30,7 @@ from gpt_researcher.utils.enum import ReportType
 from gpt_researcher.utils.research_budget import (
     build_research_policy,
     execution_policy,
+    report_word_target,
     validate_research_duration,
 )
 
@@ -446,6 +447,15 @@ def check_research_dependency_status() -> Dict[str, Any]:
             "deep_research_fallback_corroboration_enabled": os.getenv(
                 "DEEP_RESEARCH_FALLBACK_CORROBORATION_ENABLED", "false"
             ),
+            "deep_research_pdf_connect_timeout_seconds": os.getenv(
+                "DEEP_RESEARCH_PDF_CONNECT_TIMEOUT_SECONDS", "3"
+            ),
+            "deep_research_pdf_total_timeout_seconds": os.getenv(
+                "DEEP_RESEARCH_PDF_TOTAL_TIMEOUT_SECONDS", "8"
+            ),
+            "deep_research_pdf_max_bytes": os.getenv(
+                "DEEP_RESEARCH_PDF_MAX_BYTES", str(32 * 1024 * 1024)
+            ),
             "recursive_deep_research_breadth": os.getenv("DEEP_RESEARCH_BREADTH", ""),
             "recursive_deep_research_depth": os.getenv("DEEP_RESEARCH_DEPTH", ""),
             "recursive_deep_research_concurrency": os.getenv("DEEP_RESEARCH_CONCURRENCY", ""),
@@ -567,8 +577,11 @@ async def deep_research(
     research_duration_seconds: int = 60,
 ) -> Dict[str, Any]:
     """
-    Conduct a web deep research on a given query using GPT Researcher. 
-    Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
+    Conduct bounded, cited web research using GPT Researcher.
+    Use this tool for explicit deep-research requests, any request that supplies
+    a duration, current or niche subjects, comparisons, and source-heavy
+    synthesis. Always honor an explicit deep-research request. For stable,
+    simple factual questions, prefer quick_search or normal model knowledge.
     
     Args:
         query: The research query or topic
@@ -660,7 +673,21 @@ async def _run_deep_research(
         researcher.deep_researcher.max_deepened_branches = (
             active_policy.max_deepened_branches
         )
-    researcher.trace_event("research_budget", calculated_policy.to_dict())
+    calculated_policy_payload = calculated_policy.to_dict()
+    execution_policy_payload = active_policy.to_dict()
+    researcher.trace_event(
+        "research_budget",
+        {
+            "controller_mode": calculated_policy.controller_mode,
+            "requested_duration_seconds": research_duration_seconds,
+            "calculated_policy": calculated_policy_payload,
+            "execution_policy": execution_policy_payload,
+            "policy_match": (
+                calculated_policy.policy_signature
+                == active_policy.policy_signature
+            ),
+        },
+    )
     on_progress = _build_deep_research_progress_callback(ctx)
     
     # Start research
@@ -701,6 +728,11 @@ async def _run_deep_research(
             "sources": format_sources_for_response(sources),
             "source_urls": source_urls,
             "coverage_ledger": researcher.coverage_ledger,
+            "executed_work_units": (
+                researcher.deep_researcher._executed_work_units
+                if researcher.deep_researcher
+                else active_policy.work_units
+            ),
         }
         if researcher.deep_researcher:
             response["tree_policy"] = researcher.deep_researcher.tree_policy
@@ -712,6 +744,8 @@ async def _run_deep_research(
         # switch retains the old multi-tool workflow for debugging clients.
         if _env_flag("MCP_DEEP_RESEARCH_RETURN_REPORT", True):
             await _mcp_progress(ctx, 1, 1, "Writing cited research report")
+            target_words = report_word_target(research_duration_seconds)
+            researcher.cfg.total_words = target_words
             researcher.trace_event("report_generation", {"state": "started"})
             report_started_at = time.perf_counter()
             report = await researcher.write_report()
@@ -733,12 +767,19 @@ async def _run_deep_research(
             )
             response["report"] = report
             response["report_generated"] = True
+            response["report_word_target"] = target_words
             response["report_generation_duration_seconds"] = round(
                 report_duration, 3
+            )
+            response["answer_ready"] = True
+            response["presentation_instruction"] = (
+                "Present the report directly. Do not factually reinterpret, "
+                "expand, or re-synthesize it."
             )
         else:
             response["context"] = context
             response["report_generated"] = False
+            response["answer_ready"] = False
         if _env_flag("MCP_EXPOSE_RESEARCH_ID", False):
             response["research_id"] = research_id
         evidence_status = (
@@ -761,6 +802,12 @@ async def _run_deep_research(
                 "estimated_research_duration_seconds": (
                     calculated_policy.estimated_research_seconds
                 ),
+                "calculated_policy_signature": (
+                    calculated_policy.policy_signature
+                ),
+                "execution_policy_signature": active_policy.policy_signature,
+                "executed_work_units": response["executed_work_units"],
+                "controller_mode": calculated_policy.controller_mode,
             })
         await _mcp_progress(ctx, 1, 1, "Deep research report completed", done=True)
         return {"status": evidence_status, **response}
@@ -777,8 +824,10 @@ async def _run_deep_research(
 async def quick_search(query: str) -> Dict[str, Any]:
     """
     Perform a quick web search on a given query and return search results with snippets.
-    This optimizes for speed over quality and is useful when an LLM doesn't need in-depth
-    information on a topic.
+    This optimizes for speed over quality. Use it for stable, simple factual
+    questions or a quick freshness check. Use deep_research when the user
+    explicitly requests research, supplies a duration, needs comparison or
+    synthesis, or asks about a current/niche topic.
     
     Args:
         query: The search query

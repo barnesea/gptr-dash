@@ -10,8 +10,15 @@ logger = get_formatted_logger()
 
 
 async def scrape_urls(
-    urls, cfg: Config, worker_pool: WorkerPool
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    urls,
+    cfg: Config,
+    worker_pool: WorkerPool,
+    *,
+    deep_research: bool = False,
+    include_failures: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | tuple[
+    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]
+]:
     """
     Scrapes the urls
     Args:
@@ -32,7 +39,35 @@ async def scrape_urls(
 
     scraper = None
     try:
-        scraper = Scraper(urls, user_agent, cfg.scraper, worker_pool=worker_pool)
+        scraper = Scraper(
+            urls,
+            user_agent,
+            cfg.scraper,
+            worker_pool=worker_pool,
+            pdf_connect_timeout_seconds=(
+                getattr(
+                    cfg,
+                    "deep_research_pdf_connect_timeout_seconds",
+                    3.0,
+                )
+                if deep_research
+                else 5.0
+            ),
+            pdf_total_timeout_seconds=(
+                getattr(
+                    cfg,
+                    "deep_research_pdf_total_timeout_seconds",
+                    8.0,
+                )
+                if deep_research
+                else 30.0
+            ),
+            pdf_max_download_bytes=getattr(
+                cfg,
+                "deep_research_pdf_max_bytes",
+                32 * 1024 * 1024,
+            ),
+        )
         scraped_data = await scraper.run()
         for item in scraped_data:
             if 'image_urls' in item:
@@ -45,6 +80,9 @@ async def scrape_urls(
         if scraper is not None and getattr(scraper, "session", None) is not None:
             scraper.session.close()
 
+    failures = list(getattr(scraper, "failures", []) or [])
+    if include_failures:
+        return scraped_data, images, failures
     return scraped_data, images
 
 

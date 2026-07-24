@@ -232,7 +232,13 @@ class ContextCompressor:
                         "title": str(item.get("title") or ""),
                         "source": url,
                         "source_tier": source_quality_tier(
-                            {"url": url, "title": item.get("title", "")}
+                            {
+                                "url": url,
+                                "title": item.get("title", ""),
+                                "_gptr_source_tier": item.get(
+                                    "_gptr_source_tier", ""
+                                ),
+                            }
                         ),
                     },
                 )

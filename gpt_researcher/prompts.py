@@ -357,14 +357,21 @@ You MUST write all used source document names at the end of the report as refere
 """
 
         tone_prompt = f"Write the report in a {tone.value} tone." if tone else ""
+        short_report_prompt = (
+            "For this short-budget report, omit methodology and generic "
+            "background or conservation sections unless the user explicitly "
+            "requested them."
+            if total_words < 800
+            else ""
+        )
 
         return f"""
 Information: "{context}"
 ---
 Using the above information, answer the following query or task: "{question}" in a detailed report --
-The report should focus on the answer to the query, should be well structured, informative,
-in-depth, and comprehensive, with facts and numbers if available and at least {total_words} words.
-You should strive to write the report as long as you can using all relevant and necessary information provided.
+The report should focus on the answer to the query, be well structured and
+evidence-dense, and target approximately {total_words} words. Do not pad it or
+claim comprehensive coverage when the supplied evidence has gaps.
 
 Please follow all of the following guidelines in your report:
 - You MUST determine your own concrete and valid opinion based on the given information. Do NOT defer to general and meaningless conclusions.
@@ -379,6 +386,7 @@ Please follow all of the following guidelines in your report:
 - Don't forget to add a reference list at the end of the report in {report_format} format.
 - {reference_prompt}
 - {tone_prompt}
+- {short_report_prompt}
 You MUST write the report in the following language: {language}.
 Assume that the current date is {date.today()}.
 """
@@ -519,13 +527,20 @@ You MUST write all used source document names at the end of the report as refere
 """
 
         tone_prompt = f"Write the report in a {tone.value} tone." if tone else ""
+        short_report_prompt = (
+            "For this short-budget report, omit methodology and generic "
+            "background or conservation sections unless the user explicitly "
+            "requested them."
+            if total_words < 800
+            else ""
+        )
 
         return f"""
 Using the following hierarchically researched information and citations:
 
 "{context}"
 
-Write a comprehensive research report answering the query: "{question}"
+Write an evidence-bounded research report answering the query: "{question}"
 
 The report should:
 1. Synthesize information from multiple levels of research depth
@@ -533,7 +548,7 @@ The report should:
 3. Present a coherent narrative that builds from foundational to advanced insights
 4. Maintain proper citation of sources throughout
 5. Be well-structured with clear sections and subsections
-6. Have a minimum length of {total_words} words
+6. Target approximately {total_words} words without padding
 7. Follow {report_format} format with markdown syntax
 8. Use markdown tables, lists and other formatting features when presenting comparative data, statistics, or structured information
 
@@ -547,10 +562,11 @@ Additional requirements:
 - Use in-text citation references in {report_format} format and make it with markdown hyperlink placed at the end of the sentence or paragraph that references them like this: ([in-text citation](url)).
 - {tone_prompt}
 - Write in {language}
+- {short_report_prompt}
 
 {reference_prompt}
 
-Please write a thorough, well-researched report that synthesizes all the gathered information into a cohesive whole.
+Write a cohesive report that clearly distinguishes verified findings from evidence gaps.
 Assume the current date is {datetime.now(timezone.utc).strftime('%B %d, %Y')}.
 """
 

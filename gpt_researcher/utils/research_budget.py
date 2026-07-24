@@ -18,6 +18,8 @@ MAX_RESEARCH_DURATION_SECONDS = 600
 MAX_CALIBRATED_ASPECTS = 6
 MAX_CALIBRATED_REPAIRS = 8
 MAX_CALIBRATED_DEEPENED_BRANCHES = 4
+POLICY_SCHEMA_VERSION = 2
+CALIBRATION_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -40,8 +42,35 @@ class ResearchPolicy:
     calibration_fingerprint: str = ""
     controller_mode: str = "enabled"
 
+    @property
+    def work_units(self) -> float:
+        return _policy_work_units(self)
+
+    @property
+    def policy_signature(self) -> str:
+        payload = {
+            "version": POLICY_SCHEMA_VERSION,
+            "aspect_count": self.aspect_count,
+            "repair_allowance": self.repair_allowance,
+            "max_repairs_per_aspect": self.max_repairs_per_aspect,
+            "max_deepened_branches": self.max_deepened_branches,
+            "result_cards_per_query": self.result_cards_per_query,
+            "scrape_cap_per_query": self.scrape_cap_per_query,
+            "max_depth": self.max_depth,
+            "concurrency_limit": self.concurrency_limit,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            **asdict(self),
+            "policy_schema_version": POLICY_SCHEMA_VERSION,
+            "policy_signature": self.policy_signature,
+            "work_units": self.work_units,
+        }
 
 
 def validate_research_duration(value: Any) -> int:
@@ -122,6 +151,14 @@ def research_stack_fingerprint(cfg: Any) -> str:
         "retrievers": sorted(getattr(cfg, "retrievers", []) or []),
         "scraper": getattr(cfg, "scraper", ""),
         "concurrency": int(getattr(cfg, "deep_research_concurrency", 4)),
+        "source_selector_mode": getattr(cfg, "source_selector_mode", "auto"),
+        "pdf_connect_timeout": float(
+            getattr(cfg, "deep_research_pdf_connect_timeout_seconds", 3.0)
+        ),
+        "pdf_total_timeout": float(
+            getattr(cfg, "deep_research_pdf_total_timeout_seconds", 8.0)
+        ),
+        "policy_schema_version": POLICY_SCHEMA_VERSION,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:20]
@@ -148,37 +185,70 @@ def _read_successful_samples(
     for path in files:
         budget: dict[str, Any] | None = None
         completed: dict[str, Any] | None = None
-        stage_seconds: dict[str, float] = {}
+        critical_path: dict[str, Any] | None = None
         try:
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     entry = json.loads(line)
                     if entry.get("type") == "research_budget":
                         budget = entry.get("data") or {}
-                    elif entry.get("type") == "stage_timing":
-                        data = entry.get("data") or {}
-                        stage = str(data.get("stage") or "")
-                        if stage:
-                            stage_seconds[stage] = stage_seconds.get(
-                                stage, 0.0
-                            ) + float(data.get("duration_seconds") or 0)
+                    elif entry.get("type") == "critical_path_timing":
+                        critical_path = entry.get("data") or {}
                     elif entry.get("type") == "job_completed":
                         completed = entry.get("data") or {}
         except (OSError, json.JSONDecodeError, TypeError):
             continue
         if not budget or not completed or completed.get("status") != "success":
             continue
-        requested = int(budget.get("requested_duration_seconds") or 0)
-        if budget.get("calibration_fingerprint") != fingerprint:
+        calculated = budget.get("calculated_policy") or budget
+        executed = budget.get("execution_policy")
+        if not isinstance(calculated, dict) or not isinstance(executed, dict):
+            # Version-one trajectories did not prove which policy ran.
+            continue
+        if str(calculated.get("controller_mode") or "").lower() != "enabled":
+            continue
+        if (
+            calculated.get("policy_signature")
+            != executed.get("policy_signature")
+        ):
+            continue
+        if int(calculated.get("policy_schema_version") or 0) != POLICY_SCHEMA_VERSION:
+            continue
+        requested = int(calculated.get("requested_duration_seconds") or 0)
+        if calculated.get("calibration_fingerprint") != fingerprint:
             continue
         if not duration_band[0] <= requested <= duration_band[1]:
             continue
         actual = completed.get("actual_research_duration_seconds")
-        if isinstance(actual, (int, float)) and actual > 0:
+        planning = float(
+            (critical_path or {}).get("planning_wall_seconds")
+            or (critical_path or {}).get("planning_seconds")
+            or 0
+        )
+        research_tree = float(
+            (critical_path or {}).get("research_tree_wall_seconds")
+            or (critical_path or {}).get("research_tree_seconds")
+            or 0
+        )
+        work_units = float(
+            (critical_path or {}).get("executed_work_units")
+            or executed.get("work_units")
+            or 0
+        )
+        if (
+            isinstance(actual, (int, float))
+            and actual > 0
+            and planning >= 0
+            and research_tree > 0
+            and work_units > 0
+        ):
             samples.append(
                 {
                     "actual_research_seconds": float(actual),
-                    "stage_seconds": stage_seconds,
+                    "planning_seconds": planning,
+                    "research_tree_seconds": research_tree,
+                    "tree_seconds_per_work_unit": research_tree / work_units,
+                    "work_units": work_units,
                 }
             )
         if len(samples) >= limit:
@@ -206,25 +276,34 @@ def _persist_calibration(
     fingerprint: str,
     sample_count: int,
     p75_research_seconds: float,
-    p75_stage_seconds: dict[str, float],
+    p75_planning_seconds: float,
+    p75_tree_seconds_per_work_unit: float,
 ) -> None:
     """Persist a compact, non-secret calibration snapshot atomically."""
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / "research_budget_calibration.json"
-    payload: dict[str, Any] = {"version": 1, "stacks": {}}
+    payload: dict[str, Any] = {
+        "version": CALIBRATION_FORMAT_VERSION,
+        "stacks": {},
+    }
     try:
         if destination.exists():
             loaded = json.loads(destination.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict) and isinstance(loaded.get("stacks"), dict):
+            if (
+                isinstance(loaded, dict)
+                and loaded.get("version") == CALIBRATION_FORMAT_VERSION
+                and isinstance(loaded.get("stacks"), dict)
+            ):
                 payload = loaded
     except (OSError, json.JSONDecodeError):
         pass
     payload["stacks"][fingerprint] = {
         "sample_count": sample_count,
         "p75_research_seconds": round(p75_research_seconds, 3),
-        "p75_stage_seconds": {
-            key: round(value, 3) for key, value in p75_stage_seconds.items()
-        },
+        "p75_planning_seconds": round(p75_planning_seconds, 3),
+        "p75_tree_seconds_per_work_unit": round(
+            p75_tree_seconds_per_work_unit, 3
+        ),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     temp_name = ""
@@ -260,15 +339,20 @@ def _cards_for_aspects(aspect_count: int) -> int:
     return 15
 
 
-def _calibrate_policy(policy: ResearchPolicy, p75: float) -> ResearchPolicy:
+def _calibrate_policy(
+    policy: ResearchPolicy,
+    planning_p75: float,
+    tree_seconds_per_work_unit_p75: float,
+) -> ResearchPolicy:
     """Scale bounded work down or up using matching-stack p75 observations."""
-    if p75 <= 0:
+    if tree_seconds_per_work_unit_p75 <= 0:
         return policy
     calibrated = policy
-    baseline_units = max(_policy_work_units(policy), 1.0)
 
     def estimate(candidate: ResearchPolicy) -> float:
-        return p75 * (_policy_work_units(candidate) / baseline_units)
+        return planning_p75 + (
+            tree_seconds_per_work_unit_p75 * _policy_work_units(candidate)
+        )
 
     estimated = estimate(calibrated)
     while estimated > policy.requested_duration_seconds * 1.05:
@@ -364,25 +448,20 @@ def build_research_policy(duration: Any, cfg: Any) -> ResearchPolicy:
         limit=50,
     )
     p75 = _percentile_75(sample["actual_research_seconds"] for sample in samples)
-    stages = {
-        stage
-        for sample in samples
-        for stage in (sample.get("stage_seconds") or {})
-    }
-    p75_stages = {
-        stage: _percentile_75(
-            (sample.get("stage_seconds") or {}).get(stage, 0.0)
-            for sample in samples
-        )
-        for stage in stages
-    }
+    p75_planning = _percentile_75(
+        sample["planning_seconds"] for sample in samples
+    )
+    p75_tree_per_unit = _percentile_75(
+        sample["tree_seconds_per_work_unit"] for sample in samples
+    )
     try:
         _persist_calibration(
             directory,
             fingerprint=fingerprint,
             sample_count=len(samples),
             p75_research_seconds=p75,
-            p75_stage_seconds=p75_stages,
+            p75_planning_seconds=p75_planning,
+            p75_tree_seconds_per_work_unit=p75_tree_per_unit,
         )
     except OSError:
         pass
@@ -390,16 +469,17 @@ def build_research_policy(duration: Any, cfg: Any) -> ResearchPolicy:
     minimum = max(1, int(getattr(cfg, "research_budget_calibration_min_samples", 10)))
     if len(samples) < minimum:
         return replace(policy, calibration_sample_count=len(samples))
-    calibrated = _calibrate_policy(policy, p75)
+    calibrated = _calibrate_policy(
+        policy, p75_planning, p75_tree_per_unit
+    )
     return replace(
         calibrated,
         estimated_stage_seconds={
             **calibrated.estimated_stage_seconds,
-            **{
-                stage: round(value, 3)
-                for stage, value in p75_stages.items()
-                if value > 0
-            },
+            "planning": round(p75_planning, 3),
+            "research_tree": round(
+                p75_tree_per_unit * calibrated.work_units, 3
+            ),
         },
         calibration_source="local_p75",
         calibration_sample_count=len(samples),
@@ -426,3 +506,19 @@ def execution_policy(policy: ResearchPolicy, cfg: Any) -> ResearchPolicy:
         ),
         max_depth=max(1, min(int(getattr(cfg, "deep_research_depth", 2)), 2)),
     )
+
+
+def report_word_target(duration: Any) -> int:
+    """Return a report-size target proportional to the research request."""
+    seconds = validate_research_duration(duration)
+    if seconds < 30:
+        return 300
+    if seconds < 60:
+        return 500
+    if seconds < 120:
+        return 800
+    if seconds < 240:
+        return 1200
+    if seconds < 420:
+        return 1600
+    return 2000

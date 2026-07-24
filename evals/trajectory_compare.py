@@ -40,6 +40,7 @@ def summarize(path: Path) -> dict[str, Any]:
     compression_events = 0
     compression_rescues = 0
     stage_timings: Counter[str] = Counter()
+    critical_path: dict[str, Any] = {}
 
     for event in events:
         event_type = event.get("type")
@@ -57,7 +58,13 @@ def summarize(path: Path) -> dict[str, Any]:
                 url = str(selected.get("url") or "")
                 if url:
                     selected_urls.add(url)
-                source_tiers[str(selected.get("tier") or "unknown")] += 1
+                source_tiers[
+                    str(
+                        selected.get("tier")
+                        or selected.get("source_tier")
+                        or "unknown"
+                    )
+                ] += 1
             for rejected in data.get("rejected") or []:
                 url = str(rejected.get("url") or "")
                 if url:
@@ -87,6 +94,8 @@ def summarize(path: Path) -> dict[str, Any]:
             stage_timings[str(data.get("stage") or "unknown")] += float(
                 data.get("duration_seconds") or 0
             )
+        elif event_type == "critical_path_timing":
+            critical_path = data
         elif event_type == "job_completed":
             final = data
 
@@ -96,18 +105,20 @@ def summarize(path: Path) -> dict[str, Any]:
     high_quality_sources = (
         source_tiers.get("primary", 0) + source_tiers.get("reputable", 0)
     )
+    calculated_budget = budget.get("calculated_policy") or budget
+    execution_budget = budget.get("execution_policy") or {}
     requested = float(
         final.get("requested_research_duration_seconds")
-        or budget.get("requested_duration_seconds")
+        or calculated_budget.get("requested_duration_seconds")
         or 0
     )
     estimated = float(
         final.get("estimated_research_duration_seconds")
-        or budget.get("estimated_research_seconds")
+        or calculated_budget.get("estimated_research_seconds")
         or 0
     )
     actual = float(final.get("actual_research_duration_seconds") or 0)
-    estimated_stages = budget.get("estimated_stage_seconds") or {}
+    estimated_stages = calculated_budget.get("estimated_stage_seconds") or {}
     ready_aspects = sum(
         entry.get("state") == "evidence_ready" for entry in coverage_entries
     )
@@ -160,9 +171,39 @@ def summarize(path: Path) -> dict[str, Any]:
         "requested_research_seconds": requested,
         "estimated_research_seconds": estimated,
         "actual_research_seconds": actual,
+        "policy_schema_version": calculated_budget.get(
+            "policy_schema_version"
+        ),
+        "calculated_policy_signature": calculated_budget.get(
+            "policy_signature", ""
+        ),
+        "execution_policy_signature": execution_budget.get(
+            "policy_signature", ""
+        ),
+        "calculated_work_units": calculated_budget.get("work_units", 0),
+        "executed_work_units": (
+            critical_path.get("executed_work_units")
+            or final.get("executed_work_units")
+            or execution_budget.get("work_units", 0)
+        ),
+        "critical_path_seconds": round(
+            float(critical_path.get("research_wall_seconds") or actual), 3
+        ),
+        "planning_wall_seconds": round(
+            float(critical_path.get("planning_wall_seconds") or 0), 3
+        ),
+        "research_tree_wall_seconds": round(
+            float(critical_path.get("research_tree_wall_seconds") or 0), 3
+        ),
+        "parallel_worker_seconds": round(
+            float(critical_path.get("parallel_worker_seconds") or 0), 3
+        ),
         "duration_estimation_error_rate": round(
             abs(actual - estimated) / requested, 4
         ) if requested else 0.0,
+        "worker_stage_seconds": {
+            key: round(value, 3) for key, value in stage_timings.items()
+        },
         "stage_timings_seconds": {
             key: round(value, 3) for key, value in stage_timings.items()
         },

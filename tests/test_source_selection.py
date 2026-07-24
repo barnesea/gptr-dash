@@ -65,6 +65,48 @@ def test_selector_auto_skips_clear_primary_and_uses_llm_for_ambiguous_candidates
     ]
     assert not should_use_model_selector("Rust async runtime guide", primary, "auto")
     assert should_use_model_selector("Rust async runtime guide", ambiguous, "auto")
+
+
+def test_general_science_source_tiers_and_social_rejection():
+    assert source_quality_tier(
+        {"url": "https://www.fisheries.noaa.gov/species/green-turtle"}
+    ) == "primary"
+    assert source_quality_tier(
+        {"url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12345/"}
+    ) == "primary"
+    assert source_quality_tier(
+        {"url": "https://doi.org/10.1000/example"}
+    ) == "primary"
+    assert source_quality_tier(
+        {"url": "https://www.si.edu/spotlight/sea-turtles"}
+    ) == "reputable"
+    assert source_quality_tier(
+        {"url": "https://www.researchgate.net/publication/12345"}
+    ) == "fallback"
+    assert source_quality_tier(
+        {"url": "https://www.facebook.com/example/posts/123"}
+    ) == "reject"
+    assert source_quality_tier(
+        {"url": "https://www.facebook.com/example/posts/123"},
+        "Research Facebook content moderation policy",
+    ) == "primary"
+
+
+def test_selector_auto_skips_llm_for_decisive_fallback_score_gap():
+    query = "Rust async runtime performance scheduler"
+    candidates = [
+        {
+            "href": "https://one.example.test/guide",
+            "title": "Rust async runtime performance scheduler",
+            "body": "Detailed Rust async runtime performance scheduler evidence",
+        },
+        {
+            "href": "https://two.example.test/guide",
+            "title": "Rust async introduction",
+            "body": "Rust async overview",
+        },
+    ]
+    assert not should_use_model_selector(query, candidates, "auto")
 from gpt_researcher.prompts import PromptFamily
 
 

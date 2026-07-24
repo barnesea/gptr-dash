@@ -237,7 +237,9 @@ deep_research(query, research_duration_seconds=60)
 The accepted range is 15–600 seconds and excludes final report generation.
 The backend calculates bounded aspect coverage, selective repair, source-card
 and scrape limits, and focused deepening at job start. It never creates nested
-planner trees and never cancels active work to enforce a hard deadline.
+planner trees; individual PDF downloads are capped at eight seconds and 32 MiB.
+Report generation is measured separately and report length scales with the
+requested research duration.
 
 - 🌳 Structured, original-query-anchored aspect planning
 - 🛠️ Coverage repair before optional deepening
@@ -245,9 +247,9 @@ planner trees and never cancels active work to enforce a hard deadline.
 - ⚡️ Shared concurrency of four across focused branches
 - 📈 Job trajectories with timing calibration and compression diagnostics
 
-`RESEARCH_DURATION_CONTROLLER_MODE=off` restores the internal 2/3
-ranked/focused policy. Use `shadow` to collect calibration trajectories before
-switching to `enabled`.
+Production defaults to `RESEARCH_DURATION_CONTROLLER_MODE=enabled`.
+`off` restores the internal 2/3 ranked/focused policy; `shadow` calculates and
+records a policy while executing that rollback path.
 
 [Learn more about Deep Research](https://docs.gptr.dev/docs/gpt-researcher/gptr/deep_research) in our documentation.
 

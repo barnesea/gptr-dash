@@ -34,7 +34,17 @@ class Scraper:
     Scraper class to extract the content from the links
     """
 
-    def __init__(self, urls, user_agent, scraper, worker_pool: WorkerPool):
+    def __init__(
+        self,
+        urls,
+        user_agent,
+        scraper,
+        worker_pool: WorkerPool,
+        *,
+        pdf_connect_timeout_seconds: float = 5.0,
+        pdf_total_timeout_seconds: float = 30.0,
+        pdf_max_download_bytes: int = 32 * 1024 * 1024,
+    ):
         """
         Initialize the Scraper class.
         Args:
@@ -48,6 +58,10 @@ class Scraper:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
         self.scraper = scraper
+        self.pdf_connect_timeout_seconds = pdf_connect_timeout_seconds
+        self.pdf_total_timeout_seconds = pdf_total_timeout_seconds
+        self.pdf_max_download_bytes = pdf_max_download_bytes
+        self.failures: list[dict[str, str]] = []
         if self.scraper == "tavily_extract":
             self._check_pkg(self.scraper)
         if self.scraper == "firecrawl":
@@ -70,7 +84,20 @@ class Scraper:
             *(self.extract_data_from_url(url, self.session) for url in self.urls)
         )
 
-        res = [content for content in contents if content["raw_content"] is not None]
+        self.failures = [
+            {
+                "url": str(content.get("url") or ""),
+                "reason": str(content.get("error_type") or "empty_content"),
+                "detail": str(content.get("error_detail") or ""),
+            }
+            for content in contents
+            if content["raw_content"] is None
+        ]
+        res = [
+            content
+            for content in contents
+            if content["raw_content"] is not None
+        ]
         return res
 
     def _check_pkg(self, scrapper_name: str) -> None:
@@ -114,7 +141,18 @@ class Scraper:
         async with self.worker_pool.throttle():
             try:
                 Scraper = self.get_scraper(link)
-                scraper = Scraper(link, session)
+                if Scraper is PyMuPDFScraper:
+                    scraper = Scraper(
+                        link,
+                        session,
+                        connect_timeout_seconds=(
+                            self.pdf_connect_timeout_seconds
+                        ),
+                        total_timeout_seconds=self.pdf_total_timeout_seconds,
+                        max_download_bytes=self.pdf_max_download_bytes,
+                    )
+                else:
+                    scraper = Scraper(link, session)
 
                 # Get scraper name
                 scraper_name = scraper.__class__.__name__
@@ -139,6 +177,12 @@ class Scraper:
                         "raw_content": None,
                         "image_urls": [],
                         "title": title,
+                        "error_type": getattr(
+                            scraper, "last_error_type", ""
+                        ) or "empty_content",
+                        "error_detail": getattr(
+                            scraper, "last_error_detail", ""
+                        ),
                     }
 
                 # Log results
@@ -164,11 +208,28 @@ class Scraper:
                     "raw_content": content,
                     "image_urls": image_urls,
                     "title": title,
+                    "error_type": "",
+                    "error_detail": "",
                 }
 
             except Exception as e:
                 self.logger.error(f"Error processing {link}: {str(e)}")
-                return {"url": link, "raw_content": None, "image_urls": [], "title": ""}
+                message = str(e).lower()
+                reason = (
+                    "download_timeout"
+                    if "timeout" in message or "timed out" in message
+                    else "blocked"
+                    if any(value in message for value in ("403", "429", "blocked"))
+                    else "scrape_error"
+                )
+                return {
+                    "url": link,
+                    "raw_content": None,
+                    "image_urls": [],
+                    "title": "",
+                    "error_type": reason,
+                    "error_detail": str(e),
+                }
 
     def get_scraper(self, link):
         """

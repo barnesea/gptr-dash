@@ -33,6 +33,7 @@ class BrowserManager:
             researcher.cfg.max_scraper_workers,
             researcher.cfg.scraper_rate_limit_delay
         )
+        self.last_scrape_failures: list[dict[str, str]] = []
 
     async def browse_urls(self, urls: list[str], *, record_sources: bool = True) -> list[dict]:
         """
@@ -52,9 +53,21 @@ class BrowserManager:
                 self.researcher.websocket,
             )
 
-        scraped_content, images = await scrape_urls(
-            urls, self.researcher.cfg, self.worker_pool
+        scraped_content, images, failures = await scrape_urls(
+            urls,
+            self.researcher.cfg,
+            self.worker_pool,
+            deep_research=(
+                str(
+                    getattr(self.researcher, "research_mode", "standard")
+                ).startswith("deep_branch")
+                or "deep" in str(
+                    getattr(self.researcher, "report_type", "")
+                ).lower()
+            ),
+            include_failures=True,
         )
+        self.last_scrape_failures = failures
         # Focused research performs a post-scrape integrity check before a page
         # is allowed into its evidence set.  Callers can defer registration until
         # that check has run; existing browsing paths retain the legacy default.

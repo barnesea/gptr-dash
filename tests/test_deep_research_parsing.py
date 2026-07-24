@@ -18,6 +18,7 @@ from gpt_researcher.skills.deep_research import (
     _research_subject_query,
     trim_context_to_word_limit,
 )
+from gpt_researcher.utils.research_budget import cold_start_policy
 
 
 def test_aspect_plan_requires_distinct_original_query_anchors():
@@ -33,6 +34,26 @@ def test_aspect_plan_requires_distinct_original_query_anchors():
     )
 
     assert [item["id"] for item in plan] == ["a", "b"]
+
+
+def test_aspect_plan_preserves_required_scope_anchors():
+    response = """{"aspects":[{
+      "id":"taxa","priority":1,
+      "question":"Which predators affect major turtle groups?",
+      "search_query":"turtle predators sea freshwater tortoise",
+      "entities_versions_dates":[],
+      "expected_evidence_type":"government or scholarly evidence",
+      "original_query_anchors":["turtle","predators"],
+      "required_scope_anchors":["sea turtles","freshwater turtles","tortoises"]
+    }]}"""
+    plan = parse_aspect_plan_response(
+        response, 1, "What are the natural predators of turtles?"
+    )
+    assert plan[0]["required_scope_anchors"] == [
+        "sea turtles",
+        "freshwater turtles",
+        "tortoises",
+    ]
 
 
 def test_single_fallback_domain_remains_a_gap_but_two_are_usable():
@@ -64,6 +85,34 @@ def test_single_fallback_domain_remains_a_gap_but_two_are_usable():
     )
     assert state == "evidence_ready"
     assert details["corroborated"] is True
+
+
+def test_partial_taxon_evidence_is_scope_missing():
+    skill = make_skill()
+    diagnostics = {
+        "candidate_count": 1,
+        "selected_count": 1,
+        "scraped_count": 1,
+        "accepted_count": 1,
+    }
+    state, details = skill._coverage_state(
+        "Sea turtles have documented egg and hatchling predators.",
+        [{"url": "https://www.fisheries.noaa.gov/species/sea-turtle"}],
+        diagnostics,
+        aspect={
+            "required_scope_anchors": [
+                "sea turtles",
+                "freshwater turtles",
+                "tortoises",
+            ]
+        },
+    )
+    assert state == "scope_missing"
+    assert details["matched_scope_anchors"] == ["sea turtles"]
+    assert details["missing_scope_anchors"] == [
+        "freshwater turtles",
+        "tortoises",
+    ]
 
 
 def test_aspect_query_encodes_expected_primary_evidence_standard():
@@ -467,6 +516,55 @@ async def test_ranked_tree_does_not_deepen_empty_evidence():
         await skill.deep_research("topic", breadth=3, depth=2)
 
     assert len(created) == 3
+
+
+@pytest.mark.asyncio
+async def test_thirty_second_policy_runs_two_aspects_and_no_children():
+    skill = make_skill()
+    skill.research_policy = cold_start_policy(30)
+    skill.max_deepened_branches = 0
+    created = []
+
+    class FakeResearcher:
+        def __init__(self, query, **kwargs):
+            self.query = query
+            self.visited_urls = kwargs["visited_urls"]
+            self.research_sources = [
+                {
+                    "url": f"https://docs.example.test/{len(created)}",
+                    "title": query,
+                    "raw_content": f"verified evidence for {query}",
+                }
+            ]
+            created.append(self)
+
+        async def conduct_research(self):
+            return f"verified evidence for {self.query}"
+
+    async def fake_results(query, context, num_learnings=3):
+        return {
+            "learnings": [f"learning {query}"],
+            "followUpQuestions": [f"follow up {query}"],
+            "citations": {},
+        }
+
+    skill.process_research_results = fake_results  # type: ignore[method-assign]
+    root_queries = [
+        {
+            "query": f"turtle predators aspect {index}",
+            "researchGoal": f"goal {index}",
+        }
+        for index in range(2)
+    ]
+    with patch("gpt_researcher.GPTResearcher", FakeResearcher):
+        await skill.deep_research(
+            "turtle predators",
+            breadth=2,
+            depth=2,
+            serp_queries_override=root_queries,
+        )
+    assert len(created) == 2
+    assert skill._executed_work_units == 2
 
 
 def stub_search_results(monkeypatch):

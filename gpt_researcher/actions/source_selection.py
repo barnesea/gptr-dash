@@ -14,9 +14,22 @@ LOW_VALUE_HOST_MARKERS = (
     "diffchecker.", "textcompare.", "text-compare.", "draftable.",
     # Deep research may use a broader-web fallback, never generic social or
     # self-published aggregation pages as evidence.
-    "medium.com", "linkedin.com",
+    "medium.com", "linkedin.com", "facebook.com", "instagram.com",
+    "youtube.com", "youtu.be", "twitter.com", "tiktok.com",
+    "reddit.com", "quora.com", "pinterest.com",
     "articsledge.com", "dev.to", "substack.com", "hashnode.",
 )
+LOW_VALUE_EXACT_HOSTS = ("x.com",)
+NAMED_SOCIAL_HOSTS = {
+    "x.com": (" x ", "twitter"),
+    "twitter.com": ("twitter", " x "),
+    "facebook.com": ("facebook",),
+    "instagram.com": ("instagram",),
+    "youtube.com": ("youtube",),
+    "reddit.com": ("reddit",),
+    "tiktok.com": ("tiktok",),
+    "linkedin.com": ("linkedin",),
+}
 GENERIC_QUERY_ANCHORS = {
     "about", "after", "affect", "application", "applications", "changes",
     "developers", "does", "from", "have", "https", "http", "linux", "model",
@@ -27,9 +40,12 @@ GENERIC_QUERY_ANCHORS = {
     "openai",
 }
 PRIMARY_HOST_MARKERS = (
-    ".gov", ".edu", "docs.", "developer.", "github.com", "arxiv.org",
+    ".gov", "docs.", "developer.", "github.com", "arxiv.org",
     "aclanthology.org", "doi.org", "openreview.net", "standards.", "ietf.org",
-    "w3.org", "kernel.org",
+    "w3.org", "kernel.org", "pmc.ncbi.nlm.nih.gov",
+    "royalsocietypublishing.org", "journals.plos.org",
+    "frontiersin.org", "nature.com", "springer.com", "wiley.com",
+    "sciencedirect.com", "tandfonline.com",
 )
 PRIMARY_HOSTS = (
     "tensorflow.org", "pytorch.org", "huggingface.co", "openai.com",
@@ -41,6 +57,12 @@ PRIMARY_HOSTS = (
 REPUTABLE_TECH_HOST_MARKERS = (
     "lwn.net", "spectrum.ieee.org", "ieeexplore.ieee.org", "dl.acm.org",
     "acm.org", "oreilly.com", "infoq.com", "arstechnica.com",
+)
+REPUTABLE_GENERAL_HOST_MARKERS = (
+    "si.edu", "smithsonian", "museum", "aquarium", "university",
+    "nationalgeographic.com", "bbc.com", "bbc.co.uk", "reuters.com",
+    "apnews.com", "seaturtlestatus.org", "conserveturtles.org",
+    "turtle-foundation.org", "iucn.org", "wwf.org",
 )
 SUSPICIOUS_SCRAPED_TITLES = (
     "set your api key", "access denied", "just a moment", "sign in", "signin",
@@ -126,12 +148,28 @@ def _looks_like_auth_or_account_page(candidate: dict[str, Any]) -> bool:
     )
 
 
-def source_quality_tier(candidate: dict[str, Any]) -> str:
+def source_quality_tier(
+    candidate: dict[str, Any],
+    query: str = "",
+) -> str:
     """Classify a result card without trusting its prose or model judgment."""
     domain = source_domain(source_url(candidate))
+    internal_tier = str(candidate.get("_gptr_source_tier") or "")
+    if internal_tier in {"primary", "reputable", "fallback", "reject"}:
+        return internal_tier
+    padded_query = f" {str(query).lower()} "
+    for social_host, names in NAMED_SOCIAL_HOSTS.items():
+        if (
+            domain == social_host or domain.endswith(f".{social_host}")
+        ) and any(name in padded_query for name in names):
+            return "primary"
     if (
         not domain
         or any(marker in domain for marker in LOW_VALUE_HOST_MARKERS)
+        or any(
+            domain == host or domain.endswith(f".{host}")
+            for host in LOW_VALUE_EXACT_HOSTS
+        )
         or _looks_like_auth_or_account_page(candidate)
     ):
         return "reject"
@@ -139,7 +177,13 @@ def source_quality_tier(candidate: dict[str, Any]) -> str:
         domain == host or domain.endswith(f".{host}") for host in PRIMARY_HOSTS
     ):
         return "primary"
-    if any(marker in domain for marker in REPUTABLE_TECH_HOST_MARKERS):
+    if any(
+        marker in domain
+        for marker in (
+            *REPUTABLE_TECH_HOST_MARKERS,
+            *REPUTABLE_GENERAL_HOST_MARKERS,
+        )
+    ) or domain.endswith(".edu"):
         return "reputable"
     return "fallback"
 
@@ -236,6 +280,41 @@ def has_meaningful_query_anchor(query: str, candidate: dict[str, Any]) -> bool:
     )
 
 
+def _candidate_score(
+    query: str,
+    candidate: dict[str, Any],
+    index: int,
+    *,
+    anchors: set[str] | None = None,
+) -> tuple[int, str]:
+    """Return the deterministic score and tier used by both selector paths."""
+    anchors = anchors if anchors is not None else _anchor_tokens(query)
+    card = source_card(candidate, index + 1)
+    haystack = " ".join(
+        (card["title"], card["snippet"], _visible_url_text(card["url"]))
+    ).lower()
+    coverage = sum(token in haystack for token in anchors)
+    tier = source_quality_tier(candidate, query)
+    score = coverage * 3 + min(len(card["snippet"]) // 180, 3)
+    score += {
+        "primary": 8,
+        "reputable": 4,
+        "fallback": 0,
+        "reject": -10,
+    }[tier]
+    domain = source_domain(source_url(candidate))
+    if (
+        domain == "doi.org"
+        or domain == "arxiv.org"
+        or domain.endswith(".arxiv.org")
+        or domain == "pmc.ncbi.nlm.nih.gov"
+    ):
+        score += 4
+    if urlparse(source_url(candidate)).path.lower().endswith(".pdf"):
+        score += 2
+    return score, tier
+
+
 def deterministic_select_sources(
     query: str, candidates: list[dict[str, Any]], max_sources: int, *, strict: bool = False
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -252,14 +331,7 @@ def deterministic_select_sources(
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
-        card = source_card(candidate, index + 1)
-        haystack = " ".join(
-            (card["title"], card["snippet"], _visible_url_text(card["url"]))
-        ).lower()
-        coverage = sum(token in haystack for token in anchors)
-        tier = source_quality_tier(candidate)
-        score = coverage * 3 + min(len(card["snippet"]) // 180, 3)
-        score += {"primary": 8, "reputable": 4, "fallback": 0, "reject": -10}[tier]
+        score, tier = _candidate_score(query, candidate, index, anchors=anchors)
         reason = f"deterministic {tier}: query-anchor coverage, source quality, and domain diversity"
         scored.append((score, -index, candidate, reason, tier))
 
@@ -314,13 +386,24 @@ def should_use_model_selector(query: str, candidates: list[dict[str, Any]], mode
         return False
     eligible = [
         candidate for candidate in candidates
-        if source_quality_tier(candidate) != "reject" and has_meaningful_query_anchor(query, candidate)
+        if source_quality_tier(candidate, query) != "reject" and has_meaningful_query_anchor(query, candidate)
     ]
-    # A direct primary source is an objective, fast choice.  Unknown but
-    # relevant domains require a bounded model judgment only when competing.
-    if len(eligible) < 2 or any(source_quality_tier(candidate) == "primary" for candidate in eligible):
+    # Qualified primary or reputable sources make this an objective, fast
+    # selection. The model is reserved for genuinely close same-tier fallback
+    # candidates.
+    if len(eligible) < 2 or any(
+        source_quality_tier(candidate, query) in {"primary", "reputable"}
+        for candidate in eligible
+    ):
         return False
-    return True
+    scored = [
+        (*_candidate_score(query, candidate, index), index)
+        for index, candidate in enumerate(eligible)
+    ]
+    scored.sort(key=lambda item: (item[0], -item[2]), reverse=True)
+    top_score, top_tier, _ = scored[0]
+    second_score, second_tier, _ = scored[1]
+    return top_tier == second_tier and top_score - second_score < 4
 
 
 def parse_model_selection(

@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional, Set
 import asyncio
+import json
 import logging
 import re
 import time
@@ -253,6 +254,13 @@ def parse_aspect_plan_response(
         anchors = item.get("original_query_anchors") or []
         if not isinstance(anchors, list):
             anchors = [str(anchors)]
+        scope_anchors = (
+            item.get("required_scope_anchors")
+            or item.get("requiredScopeAnchors")
+            or []
+        )
+        if not isinstance(scope_anchors, list):
+            scope_anchors = [str(scope_anchors)]
         try:
             priority = max(1, int(item.get("priority") or index + 1))
         except (TypeError, ValueError):
@@ -269,6 +277,11 @@ def parse_aspect_plan_response(
                 "expected_evidence_type": expected,
                 "original_query_anchors": [
                     str(value).strip() for value in anchors if str(value).strip()
+                ],
+                "required_scope_anchors": [
+                    str(value).strip()
+                    for value in scope_anchors
+                    if str(value).strip()
                 ],
             }
         )
@@ -446,6 +459,8 @@ class DeepResearchSkill:
         self._visited_urls_lock = asyncio.Lock()
         self._active_branches = 0
         self._max_active_branches = 0
+        self._parallel_worker_seconds = 0.0
+        self._executed_work_units = 0
         self._json_handler = get_json_handler()
 
     def _emit_event(
@@ -707,6 +722,7 @@ Return ONLY a JSON object using this exact schema:
                     "entities_versions_dates": [],
                     "expected_evidence_type": expected,
                     "original_query_anchors": sorted(_aspect_tokens(query))[:8],
+                    "required_scope_anchors": [],
                 }
             )
         return plan
@@ -776,7 +792,7 @@ Return ONLY a JSON object using this exact schema:
         initial_results = [
             result
             for result in preliminary_candidates
-            if source_quality_tier(result) != "reject"
+            if source_quality_tier(result, subject_query) != "reject"
             and has_meaningful_query_anchor(subject_query, result)
         ][:max_results]
         current_datetime = datetime.now()
@@ -791,7 +807,7 @@ Preliminary result cards:
 {initial_results}
 
 Return exactly {num_aspects} distinct aspects as JSON:
-{{"aspects":[{{"id":"aspect-1","priority":1,"question":"standalone question","search_query":"standalone natural-language search query","entities_versions_dates":["concrete item"],"expected_evidence_type":"one or two specific evidence types needed for this aspect","original_query_anchors":["literal anchor"]}}]}}
+{{"aspects":[{{"id":"aspect-1","priority":1,"question":"standalone question","search_query":"standalone natural-language search query","entities_versions_dates":["concrete item"],"expected_evidence_type":"one or two specific evidence types needed for this aspect","original_query_anchors":["literal anchor"],"required_scope_anchors":["each taxon, product, version, or region this aspect claims to cover"]}}]}}
 
 Requirements:
 - Extract concrete entities, product versions, organizations, dates, and terminology from the result cards when supported.
@@ -803,6 +819,8 @@ Requirements:
 - Every search query must be standalone and visibly anchored to the original query.
 - Never put meta-language such as "original query", "user question", or "the prompt" in a search query.
 - Name the specific evidence needed for each aspect rather than copying a generic list.
+- List every taxon, product, version, or region that the aspect claims to cover
+  in required_scope_anchors. Leave it empty for a single indivisible subject.
 - Do not use search operators, generic comparative wording, or invented details.
 - Prefer primary/official or scholarly evidence; use reputable independent technical coverage when it materially adds evidence.
 - Return JSON only."""
@@ -916,6 +934,10 @@ do not invent details."""
                 "integrity_failure": "foundational technical survey methodology",
                 "compression_empty": "technical details implementation evidence",
                 "corroboration_missing": "independent technical analysis evidence",
+                "scope_missing": (
+                    " ".join(diagnostics.get("missing_scope_anchors") or [])
+                    + " primary evidence"
+                ).strip(),
             }.get(state, "primary evidence")
             base_query = _clean_planned_search_query(
                 str(aspect.get("search_query") or original_query)
@@ -1162,6 +1184,7 @@ enough."""
 
         node_id = "root.seed"
         started_at = time.perf_counter()
+        self._executed_work_units += 1
         self._emit_event(
             "direct_url_seed",
             {"state": "started", "urls": urls},
@@ -1245,11 +1268,21 @@ enough."""
         context: Any,
         sources: List[dict[str, Any]],
         diagnostics: Dict[str, Any],
+        aspect: Dict[str, Any] | None = None,
     ) -> tuple[str, Dict[str, Any]]:
         tiers = {"primary": 0, "reputable": 0, "fallback": 0, "reject": 0}
         fallback_domains: set[str] = set()
+        classification_query = " ".join(
+            value
+            for value in (
+                self.original_query,
+                str((aspect or {}).get("question") or ""),
+                str((aspect or {}).get("search_query") or ""),
+            )
+            if value
+        )
         for source in sources:
-            tier = source_quality_tier(source)
+            tier = source_quality_tier(source, classification_query)
             tiers[tier] = tiers.get(tier, 0) + 1
             if tier == "fallback":
                 domain = source_domain(source_url(source))
@@ -1260,6 +1293,11 @@ enough."""
             "fallback_domains": sorted(fallback_domains),
             "fallback_domain_count": len(fallback_domains),
             "corroborated": False,
+            "required_scope_anchors": list(
+                (aspect or {}).get("required_scope_anchors") or []
+            ),
+            "matched_scope_anchors": [],
+            "missing_scope_anchors": [],
         }
         if int(diagnostics.get("candidate_count") or 0) == 0:
             return "no_candidates", details
@@ -1275,6 +1313,43 @@ enough."""
             return "compression_empty", details
         if not sources:
             return "no_qualified_source", details
+        if tiers["primary"] + tiers["reputable"] + tiers["fallback"] == 0:
+            return "no_qualified_source", details
+        evidence_text = " ".join(
+            [
+                str(context or ""),
+                *[
+                    " ".join(
+                        str(source.get(key) or "")
+                        for key in (
+                            "title",
+                            "url",
+                            "href",
+                            "raw_content",
+                            "content",
+                        )
+                    )
+                    for source in sources
+                ],
+            ]
+        ).lower()
+        evidence_tokens = _aspect_tokens(evidence_text)
+        for scope_anchor in details["required_scope_anchors"]:
+            normalized_anchor = " ".join(
+                str(scope_anchor).lower().split()
+            ).strip()
+            anchor_tokens = _aspect_tokens(normalized_anchor)
+            matched = bool(normalized_anchor and normalized_anchor in evidence_text)
+            if not matched and anchor_tokens:
+                matched = anchor_tokens.issubset(evidence_tokens)
+            target = (
+                details["matched_scope_anchors"]
+                if matched
+                else details["missing_scope_anchors"]
+            )
+            target.append(scope_anchor)
+        if details["missing_scope_anchors"]:
+            return "scope_missing", details
         if (
             getattr(
                 self.researcher.cfg,
@@ -1315,6 +1390,12 @@ enough."""
             "question": aspect.get("question"),
             "search_query": result.get("query") or aspect.get("search_query"),
             "expected_evidence_type": aspect.get("expected_evidence_type"),
+            "required_scope_anchors": result.get(
+                "required_scope_anchors",
+                aspect.get("required_scope_anchors") or [],
+            ),
+            "matched_scope_anchors": result.get("matched_scope_anchors", []),
+            "missing_scope_anchors": result.get("missing_scope_anchors", []),
             "state": result.get("coverage_state", "no_candidates"),
             "recovery_reason": recovery_reason,
             "repair_count": repair_count,
@@ -1420,6 +1501,8 @@ enough."""
             )
             async with self._branch_semaphore:
                 started_at = time.perf_counter()
+                worker_duration_recorded = False
+                self._executed_work_units += 1
                 self._active_branches += 1
                 self._max_active_branches = max(self._max_active_branches, self._active_branches)
                 self._emit_event("deep_research_branch", {
@@ -1499,7 +1582,10 @@ enough."""
                             },
                         }
                     coverage_state, coverage_details = self._coverage_state(
-                        context_text, sources or [], diagnostics
+                        context_text,
+                        sources or [],
+                        diagnostics,
+                        aspect=serp_query.get("aspect"),
                     )
                     fallback_only = (
                         coverage_state == "evidence_ready"
@@ -1599,11 +1685,14 @@ enough."""
                         **coverage_details,
                     }
                     score, metrics = self._branch_score(result)
+                    branch_duration = time.perf_counter() - started_at
+                    self._parallel_worker_seconds += branch_duration
+                    worker_duration_recorded = True
                     self._emit_event("deep_research_branch", {
                         "state": "completed",
                         "depth": depth,
                         "query": serp_query["query"],
-                        "duration_seconds": round(time.perf_counter() - started_at, 3),
+                        "duration_seconds": round(branch_duration, 3),
                         "branch_mode": self.branch_mode,
                         "tree_policy": self.tree_policy,
                         "active_branches": self._active_branches,
@@ -1622,6 +1711,10 @@ enough."""
                     print(f"\n❌ DEEP RESEARCH ERROR: {str(e)}\n{error_details}", flush=True)
                     return None
                 finally:
+                    if not worker_duration_recorded:
+                        self._parallel_worker_seconds += (
+                            time.perf_counter() - started_at
+                        )
                     self._active_branches = max(0, self._active_branches - 1)
 
         # Process queries concurrently with limit
@@ -1716,6 +1809,15 @@ enough."""
                             str(result.get("coverage_state") or "no_candidates"),
                             {
                                 **(result.get("retrieval_diagnostics") or {}),
+                                "required_scope_anchors": result.get(
+                                    "required_scope_anchors", []
+                                ),
+                                "matched_scope_anchors": result.get(
+                                    "matched_scope_anchors", []
+                                ),
+                                "missing_scope_anchors": result.get(
+                                    "missing_scope_anchors", []
+                                ),
                                 "attempted_queries": attempted_queries.get(
                                     str(result["aspect"].get("id")), []
                                 ),
@@ -1851,7 +1953,14 @@ enough."""
 
         local = self._merge_results(results, learnings, citations, visited_urls)
         deeper_result_sets: List[Dict[str, Any]] = []
-        if depth > 1:
+        deepening_allowed = (
+            depth > 1
+            and (
+                self.research_policy is None
+                or self.research_policy.max_deepened_branches > 0
+            )
+        )
+        if deepening_allowed:
             deepening_started_at = time.perf_counter()
             new_breadth = 2
             new_depth = depth - 1
@@ -2038,6 +2147,7 @@ enough."""
             flush=True,
         )
         start_time = time.time()
+        research_wall_started_at = time.perf_counter()
         self._emit_event("deep_research_policy", {
             "breadth": self.breadth,
             "depth": self.depth,
@@ -2056,6 +2166,7 @@ enough."""
         initial_costs = self.researcher.get_costs()
 
         direct_result = None
+        direct_retrieval_duration = 0.0
         direct_urls = extract_query_urls(self.researcher.query)
         if (
             direct_urls
@@ -2063,18 +2174,23 @@ enough."""
                 self.researcher.cfg, "deep_research_direct_url_seed", False
             )
         ):
+            direct_started_at = time.perf_counter()
             direct_result = await self._research_direct_urls(direct_urls)
+            direct_retrieval_duration = (
+                time.perf_counter() - direct_started_at
+            )
 
         planning_started_at = time.perf_counter()
         aspect_plan = await self.generate_aspect_plan(
             self.researcher.query, self.breadth
         )
+        planning_duration = time.perf_counter() - planning_started_at
         self._emit_event(
             "stage_timing",
             {
                 "stage": "planning",
                 "duration_seconds": round(
-                    time.perf_counter() - planning_started_at, 3
+                    planning_duration, 3
                 ),
                 "estimated_seconds": self._estimated_stage_seconds("planning"),
                 "aspect_count": len(aspect_plan),
@@ -2105,20 +2221,13 @@ enough."""
             (direct_result or {}).get("context"),
             (direct_result or {}).get("sources") or [],
             direct_diagnostics,
+            aspect=aspect_plan[0] if aspect_plan else None,
         )
         direct_usable = direct_has_evidence and direct_state == "evidence_ready"
         direct_ledger_entry: Dict[str, Any] | None = None
         if direct_usable and aspect_plan:
             direct_sources = direct_result.get("sources") or []
-            direct_tiers = {
-                "primary": 0,
-                "reputable": 0,
-                "fallback": 0,
-                "reject": 0,
-            }
-            for source in direct_sources:
-                tier = source_quality_tier(source)
-                direct_tiers[tier] = direct_tiers.get(tier, 0) + 1
+            direct_tiers = direct_details.get("source_tiers") or {}
             direct_branch = {
                 "query": aspect_plan[0]["search_query"],
                 "sources": direct_sources,
@@ -2166,17 +2275,39 @@ enough."""
                     "direct_url_seed": True,
                 },
             )
+        research_tree_duration = time.perf_counter() - initial_retrieval_started_at
         self._emit_event(
             "stage_timing",
             {
                 "stage": "research_tree",
                 "duration_seconds": round(
-                    time.perf_counter() - initial_retrieval_started_at, 3
+                    research_tree_duration, 3
                 ),
                 "aspect_count": len(aspect_plan),
             },
         )
-        if direct_result and (
+        self._emit_event(
+            "critical_path_timing",
+            {
+                "planning_wall_seconds": round(planning_duration, 3),
+                "research_tree_wall_seconds": round(
+                    direct_retrieval_duration + research_tree_duration, 3
+                ),
+                "direct_retrieval_wall_seconds": round(
+                    direct_retrieval_duration, 3
+                ),
+                "research_wall_seconds": round(
+                    time.perf_counter() - research_wall_started_at, 3
+                ),
+                "parallel_worker_seconds": round(
+                    self._parallel_worker_seconds, 3
+                ),
+                "executed_work_units": (
+                    self._executed_work_units
+                ),
+            },
+        )
+        if direct_usable and direct_result and (
             direct_result.get("context") or direct_result.get("sources")
         ):
             results = self._merge_results([direct_result, results])
@@ -2207,20 +2338,35 @@ enough."""
             context_with_citations.extend(results['context'])
 
         if self.coverage_ledger:
-            gap_lines = [
-                (
-                    f"- {item['aspect_id']}: {item['state']} "
-                    f"({item['question']})"
-                )
+            writer_ledger = [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "aspect_id",
+                        "question",
+                        "state",
+                        "expected_evidence_type",
+                        "source_tiers",
+                        "required_scope_anchors",
+                        "matched_scope_anchors",
+                        "missing_scope_anchors",
+                        "corroborated",
+                        "verified_urls",
+                    )
+                }
                 for item in self.coverage_ledger
-                if item.get("state") != "evidence_ready"
             ]
-            if gap_lines:
-                context_with_citations.append(
-                    "Evidence coverage ledger (workflow metadata, not evidence):\n"
-                    + "\n".join(gap_lines)
-                    + "\nDo not fill these evidence gaps with unsupported claims."
-                )
+            context_with_citations.append(
+                "EVIDENCE COVERAGE LEDGER (authoritative workflow metadata, "
+                "not factual evidence):\n"
+                + json.dumps(writer_ledger, ensure_ascii=False)
+                + "\nUse factual material only from evidence_ready aspects. "
+                "Explicitly state unresolved gaps; never resolve them from model "
+                "knowledge. Do not call fallback sources primary, generalize "
+                "beyond matched scope anchors, or classify diseases, parasites, "
+                "or environmental hazards as predators unless verified evidence "
+                "explicitly supports that category."
+            )
 
         # Trim final context to word limit
         final_context = trim_context_to_word_limit(context_with_citations)

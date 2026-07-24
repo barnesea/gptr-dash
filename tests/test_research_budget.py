@@ -8,6 +8,7 @@ from gpt_researcher.utils.research_budget import (
     build_research_policy,
     cold_start_policy,
     execution_policy,
+    report_word_target,
     research_stack_fingerprint,
     validate_research_duration,
 )
@@ -84,15 +85,23 @@ def test_shadow_executes_legacy_policy_but_retains_calculated_policy(tmp_path):
 
 def test_calibration_uses_matching_stack_after_ten_successes(tmp_path):
     cfg = make_cfg(tmp_path)
-    fingerprint = research_stack_fingerprint(cfg)
+    expected = build_research_policy(60, cfg).to_dict()
     for index in range(10):
         path = tmp_path / f"sample-{index}.jsonl"
         events = [
             {
                 "type": "research_budget",
                 "data": {
-                    "requested_duration_seconds": 60,
-                    "calibration_fingerprint": fingerprint,
+                    "controller_mode": "enabled",
+                    "calculated_policy": expected,
+                    "execution_policy": expected,
+                },
+            },
+            {
+                "type": "critical_path_timing",
+                "data": {
+                    "planning_wall_seconds": 5,
+                    "research_tree_wall_seconds": 95 + index,
                 },
             },
             {
@@ -118,7 +127,7 @@ def test_calibration_uses_matching_stack_after_ten_successes(tmp_path):
 
 def test_calibration_expands_fast_stack_within_global_caps(tmp_path):
     cfg = make_cfg(tmp_path)
-    fingerprint = research_stack_fingerprint(cfg)
+    expected = build_research_policy(120, cfg).to_dict()
     for index in range(10):
         path = tmp_path / f"fast-{index}.jsonl"
         path.write_text(
@@ -128,8 +137,18 @@ def test_calibration_expands_fast_stack_within_global_caps(tmp_path):
                         {
                             "type": "research_budget",
                             "data": {
-                                "requested_duration_seconds": 120,
-                                "calibration_fingerprint": fingerprint,
+                                "controller_mode": "enabled",
+                                "calculated_policy": expected,
+                                "execution_policy": expected,
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "critical_path_timing",
+                            "data": {
+                                "planning_wall_seconds": 3,
+                                "research_tree_wall_seconds": 40 + index,
                             },
                         }
                     ),
@@ -158,6 +177,65 @@ def test_calibration_expands_fast_stack_within_global_caps(tmp_path):
     assert policy.aspect_count <= 6
     assert policy.repair_allowance <= 8
     assert policy.max_deepened_branches <= 4
+
+
+def test_shadow_and_policy_mismatch_samples_are_excluded(tmp_path):
+    cfg = make_cfg(tmp_path)
+    calculated = build_research_policy(60, cfg).to_dict()
+    shadow = {**calculated, "controller_mode": "shadow"}
+    mismatched = {**calculated, "policy_signature": "different"}
+    for name, budget in (
+        (
+            "shadow",
+            {
+                "controller_mode": "shadow",
+                "calculated_policy": shadow,
+                "execution_policy": shadow,
+            },
+        ),
+        (
+            "mismatch",
+            {
+                "controller_mode": "enabled",
+                "calculated_policy": calculated,
+                "execution_policy": mismatched,
+            },
+        ),
+    ):
+        (tmp_path / f"{name}.jsonl").write_text(
+            "\n".join(
+                json.dumps(event)
+                for event in (
+                    {"type": "research_budget", "data": budget},
+                    {
+                        "type": "critical_path_timing",
+                        "data": {
+                            "planning_wall_seconds": 2,
+                            "research_tree_wall_seconds": 20,
+                        },
+                    },
+                    {
+                        "type": "job_completed",
+                        "data": {
+                            "status": "success",
+                            "actual_research_duration_seconds": 22,
+                        },
+                    },
+                )
+            ),
+            encoding="utf-8",
+        )
+    policy = build_research_policy(60, cfg)
+    assert policy.calibration_sample_count == 0
+    assert policy.calibration_source == "cold_start"
+
+
+@pytest.mark.parametrize(
+    ("duration", "words"),
+    [(15, 300), (30, 500), (60, 800), (120, 1200), (240, 1600), (420, 2000)],
+)
+def test_report_word_targets(duration, words):
+    assert report_word_target(duration) == words
 
 
 def test_corrupt_and_other_stack_samples_fall_back_to_cold_start(tmp_path):

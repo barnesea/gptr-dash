@@ -323,6 +323,13 @@ class ResearchConductor:
         scraped_content = await self.researcher.scraper_manager.browse_urls(
             new_search_urls, record_sources=not integrity_enabled
         )
+        scrape_failures = list(
+            getattr(
+                self.researcher.scraper_manager,
+                "last_scrape_failures",
+                [],
+            )
+        )
 
         # A selected canonical page may fail while its raw, HTML, or PDF form
         # remains fetchable. Try only deterministic same-source variants.
@@ -352,6 +359,13 @@ class ResearchConductor:
             )
             alternate_content = await self.researcher.scraper_manager.browse_urls(
                 alternate_urls, record_sources=not integrity_enabled
+            )
+            scrape_failures.extend(
+                getattr(
+                    self.researcher.scraper_manager,
+                    "last_scrape_failures",
+                    [],
+                )
             )
             scraped_content.extend(alternate_content)
             self.last_retrieval_diagnostics["canonical_alternative_attempt_count"] = (
@@ -396,12 +410,21 @@ class ResearchConductor:
                 "selected_count": len(new_search_urls),
                 "scraped_count": len(scraped_content),
                 "accepted_count": len(scraped_content),
+                "scrape_failures": scrape_failures,
                 "compression": compression.diagnostics(),
                 "compression_duration_seconds": round(
                     time.perf_counter() - compression_started_at, 3
                 ),
             }
         )
+        if scrape_failures:
+            self._trace(
+                "scrape_failures",
+                {
+                    "query": self.researcher.query,
+                    "failures": scrape_failures,
+                },
+            )
         self._trace(
             "compression",
             {
@@ -1098,11 +1121,16 @@ class ResearchConductor:
             selected_candidates_by_url[url] = result
             raw_content = result.get("raw_content")
             if raw_content and len(raw_content) > 100:
-                prefetched_content.append({
+                prefetched = {
                     "url": url,
                     "raw_content": raw_content,
                     "title": result.get("title", ""),
-                })
+                }
+                if result.get("_gptr_source_tier"):
+                    prefetched["_gptr_source_tier"] = result[
+                        "_gptr_source_tier"
+                    ]
+                prefetched_content.append(prefetched)
             else:
                 new_search_urls.append(url)
 
@@ -1168,7 +1196,7 @@ class ResearchConductor:
         else:
             selected, reasons = parsed
             has_higher_tier = any(
-                source_quality_tier(candidate) in {"primary", "reputable"}
+                source_quality_tier(candidate, query) in {"primary", "reputable"}
                 and has_meaningful_query_anchor(query, candidate)
                 for candidate in candidates
             )
@@ -1176,8 +1204,12 @@ class ResearchConductor:
                 candidate for candidate in selected
                 if (
                     not has_meaningful_query_anchor(query, candidate)
-                    or source_quality_tier(candidate) == "reject"
-                    or (strict and source_quality_tier(candidate) == "fallback" and has_higher_tier)
+                    or source_quality_tier(candidate, query) == "reject"
+                    or (
+                        strict
+                        and source_quality_tier(candidate, query) == "fallback"
+                        and has_higher_tier
+                    )
                 )
             ]
             if off_topic:
@@ -1189,6 +1221,10 @@ class ResearchConductor:
                     selected, fallback_reasons = deterministic_select_sources(query, candidates, max_sources, strict=strict)
                     reasons.update(fallback_reasons)
 
+        for candidate in selected:
+            candidate["_gptr_source_tier"] = source_quality_tier(
+                candidate, query
+            )
         selected_urls = {source_url(candidate) for candidate in selected}
         selection_event = {
             "query": query,
@@ -1201,12 +1237,12 @@ class ResearchConductor:
             "selected_count": len(selected),
             "candidates": cards,
             "selected": [
-                {"url": source_url(candidate), "tier": source_quality_tier(candidate), "reason": reasons.get(source_url(candidate), "selected")}
+                {"url": source_url(candidate), "tier": source_quality_tier(candidate, query), "reason": reasons.get(source_url(candidate), "selected")}
                 for candidate in selected
             ],
             "selected_urls": [source_url(candidate) for candidate in selected],
             "rejected": [
-                {"url": source_url(candidate), "tier": source_quality_tier(candidate), "reason": reasons.get(source_url(candidate), "not selected")}
+                {"url": source_url(candidate), "tier": source_quality_tier(candidate, query), "reason": reasons.get(source_url(candidate), "not selected")}
                 for candidate in candidates
                 if source_url(candidate) not in selected_urls
             ],
@@ -1265,6 +1301,13 @@ class ResearchConductor:
         scraped_content = await self.researcher.scraper_manager.browse_urls(
             new_search_urls, record_sources=not integrity_enabled
         )
+        scrape_failures = list(
+            getattr(
+                self.researcher.scraper_manager,
+                "last_scrape_failures",
+                [],
+            )
+        )
 
         fetched_urls = {source_url(item) for item in scraped_content}
         alternate_candidates: dict[str, dict] = {}
@@ -1290,6 +1333,13 @@ class ResearchConductor:
             alternate_content = await self.researcher.scraper_manager.browse_urls(
                 alternate_urls, record_sources=not integrity_enabled
             )
+            scrape_failures.extend(
+                getattr(
+                    self.researcher.scraper_manager,
+                    "last_scrape_failures",
+                    [],
+                )
+            )
             scraped_content.extend(alternate_content)
             self.last_retrieval_diagnostics[
                 "canonical_alternative_attempt_count"
@@ -1309,6 +1359,15 @@ class ResearchConductor:
         # Merge pre-fetched content from retrievers that already provide full text
         scraped_content.extend(prefetched_content)
         self.last_retrieval_diagnostics["scraped_count"] = len(scraped_content)
+        self.last_retrieval_diagnostics["scrape_failures"] = scrape_failures
+        if scrape_failures:
+            self._trace(
+                "scrape_failures",
+                {
+                    "query": sub_query,
+                    "failures": scrape_failures,
+                },
+            )
 
         if integrity_enabled:
             scraped_content = await self._validate_post_scrape_sources(
@@ -1339,6 +1398,11 @@ class ResearchConductor:
             if reason:
                 rejected.append({"url": url, "reason": reason})
             else:
+                selected_candidate = selected_candidates_by_url.get(url) or {}
+                if selected_candidate.get("_gptr_source_tier"):
+                    item["_gptr_source_tier"] = selected_candidate[
+                        "_gptr_source_tier"
+                    ]
                 accepted.append(item)
 
         # Unlike the legacy browser path, only verified pages are exposed in
