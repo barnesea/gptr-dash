@@ -84,6 +84,8 @@ class GPTResearcher:
         mcp_strategy: str | None = None,
         research_mode: str | None = None,
         visited_urls_lock: asyncio.Lock | None = None,
+        shared_scrape_cache: dict[str, dict | None] | None = None,
+        shared_scrape_futures: dict[str, asyncio.Future] | None = None,
         trajectory: ResearchTrajectory | None = None,
         trajectory_id: str | None = None,
         trajectory_node_id: str = "root",
@@ -201,6 +203,14 @@ class GPTResearcher:
         self.visited_urls = visited_urls if visited_urls is not None else set()
         self.visited_urls_lock = (
             visited_urls_lock if visited_urls_lock is not None else asyncio.Lock()
+        )
+        self.shared_scrape_cache = (
+            shared_scrape_cache if shared_scrape_cache is not None else {}
+        )
+        self.shared_scrape_futures = (
+            shared_scrape_futures
+            if shared_scrape_futures is not None
+            else {}
         )
         self.verbose = verbose
         self.context = context or []

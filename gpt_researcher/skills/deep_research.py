@@ -261,6 +261,23 @@ def parse_aspect_plan_response(
         )
         if not isinstance(scope_anchors, list):
             scope_anchors = [str(scope_anchors)]
+        def scope_tokens(value: str) -> set[str]:
+            tokens = _aspect_tokens(value)
+            return tokens | {
+                token[:-1]
+                for token in tokens
+                if token.endswith("s") and len(token) > 4
+            }
+
+        claimed_scope_tokens = scope_tokens(f"{question} {search_query}")
+        validated_scope_anchors = []
+        for value in scope_anchors:
+            anchor = str(value).strip()
+            anchor_tokens = scope_tokens(anchor)
+            if anchor and anchor_tokens and (
+                anchor_tokens & claimed_scope_tokens
+            ):
+                validated_scope_anchors.append(anchor)
         try:
             priority = max(1, int(item.get("priority") or index + 1))
         except (TypeError, ValueError):
@@ -279,9 +296,7 @@ def parse_aspect_plan_response(
                     str(value).strip() for value in anchors if str(value).strip()
                 ],
                 "required_scope_anchors": [
-                    str(value).strip()
-                    for value in scope_anchors
-                    if str(value).strip()
+                    value for value in validated_scope_anchors
                 ],
             }
         )
@@ -457,6 +472,10 @@ class DeepResearchSkill:
         # configured concurrency limit when they are run in parallel.
         self._branch_semaphore = asyncio.Semaphore(max(1, self.concurrency_limit))
         self._visited_urls_lock = asyncio.Lock()
+        self._shared_scrape_cache: dict[str, dict | None] = {}
+        self._shared_scrape_futures: dict[str, asyncio.Future] = {}
+        self.researcher.shared_scrape_cache = self._shared_scrape_cache
+        self.researcher.shared_scrape_futures = self._shared_scrape_futures
         self._active_branches = 0
         self._max_active_branches = 0
         self._parallel_worker_seconds = 0.0
@@ -813,6 +832,10 @@ Requirements:
 - Extract concrete entities, product versions, organizations, dates, and terminology from the result cards when supported.
 - Each aspect must address a different required part of the original question.
 - Result cards are evidence hints, not new scope. Never create an aspect for a card topic unless the original query actually requires it.
+- When the original query names a broad category without a subtype, allocate
+  aspects across distinct major subgroups, environments, versions, or regions.
+  Do not spend every aspect on life stages of the one subgroup most visible in
+  the preliminary results.
 - For comparisons or multi-entity questions, dedicate entity-specific evidence aspects when a single page is unlikely to cover every entity. Compare across those aspects during synthesis instead of requiring every product name in every search.
 - When a recency window is requested, search the full start-to-end interval; do not replace it with only the current year.
 - Preserve literal entities, versions, dates, and URLs from the original question.
@@ -821,6 +844,9 @@ Requirements:
 - Name the specific evidence needed for each aspect rather than copying a generic list.
 - List every taxon, product, version, or region that the aspect claims to cover
   in required_scope_anchors. Leave it empty for a single indivisible subject.
+- Scope anchors describe categories claimed by the aspect question. Never list
+  anticipated answers or preliminary-result examples (such as particular
+  predator species) as required scope anchors.
 - Do not use search operators, generic comparative wording, or invented details.
 - Prefer primary/official or scholarly evidence; use reputable independent technical coverage when it materially adds evidence.
 - Return JSON only."""
@@ -1525,6 +1551,8 @@ enough."""
                             "deep_branch" if focused else "deep_branch_standard"
                         ),
                         "visited_urls_lock": self._visited_urls_lock,
+                        "shared_scrape_cache": self._shared_scrape_cache,
+                        "shared_scrape_futures": self._shared_scrape_futures,
                         "trajectory": getattr(self.researcher, "trajectory", None),
                         "trajectory_node_id": branch_node_id,
                         "trajectory_parent_node_id": node_id,

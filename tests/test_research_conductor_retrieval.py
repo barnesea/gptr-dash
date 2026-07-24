@@ -1,4 +1,5 @@
 import unittest
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -140,6 +141,56 @@ class ResearchConductorRetrievalTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual([item["href"] for item in selected], ["https://kernel.org/6.12"])
+
+    async def test_concurrent_branches_share_one_scrape_result(self):
+        shared_visited = set()
+        shared_lock = asyncio.Lock()
+        shared_cache = {}
+        shared_futures = {}
+        scrape_calls = []
+
+        def make_shared_researcher():
+            researcher = self.make_researcher(FakeSnippetRetriever)
+            researcher.visited_urls = shared_visited
+            researcher.visited_urls_lock = shared_lock
+            researcher.shared_scrape_cache = shared_cache
+            researcher.shared_scrape_futures = shared_futures
+            researcher.vector_store = None
+            researcher.scraper_manager = SimpleNamespace()
+
+            async def browse_urls(urls, **kwargs):
+                if urls:
+                    scrape_calls.extend(urls)
+                    await asyncio.sleep(0.02)
+                    return [
+                        {
+                            "url": url,
+                            "title": "Rust async runtimes",
+                            "raw_content": "Rust async runtime evidence " * 10,
+                        }
+                        for url in urls
+                    ]
+                return []
+
+            researcher.scraper_manager.browse_urls = browse_urls
+            return researcher
+
+        first = ResearchConductor(make_shared_researcher())
+        second = ResearchConductor(make_shared_researcher())
+        first_result, second_result = await asyncio.gather(
+            first._scrape_data_by_urls("rust async runtimes"),
+            second._scrape_data_by_urls("rust async runtimes"),
+        )
+
+        self.assertEqual(
+            sorted(scrape_calls),
+            [
+                "https://example.com/one",
+                "https://example.com/two",
+            ],
+        )
+        self.assertEqual(len(first_result), 2)
+        self.assertEqual(len(second_result), 2)
 
 
 if __name__ == "__main__":

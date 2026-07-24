@@ -98,8 +98,13 @@ def report_quality_diagnostics(
     cited_paragraphs = [
         paragraph for paragraph in paragraphs if INLINE_LINK_PATTERN.search(paragraph)
     ]
+    has_verified_sources = any(
+        item.get("verified_urls") for item in coverage_ledger
+    )
     citation_rate = (
-        len(cited_paragraphs) / len(paragraphs) if paragraphs else 1.0
+        len(cited_paragraphs) / len(paragraphs)
+        if paragraphs and has_verified_sources
+        else 1.0
     )
     unresolved = [
         str(item.get("aspect_id") or item.get("question") or "unknown")
@@ -132,7 +137,8 @@ def report_quality_diagnostics(
     limitation_terms = re.compile(
         r"\b(?:gap|insufficient|missing|not researched|not established|"
         r"unresolved|unknown|could not verify|no verified evidence|"
-        r"evidence limitation)\b"
+        r"no verified urls?|not matched|unverified|precludes|cannot support|"
+        r"required scope anchors?|evidence limitation)\b"
     )
     unsupported_scope_claims: list[str] = []
     for item in coverage_ledger:
@@ -170,7 +176,7 @@ def report_quality_diagnostics(
     issues = []
     if references_only:
         issues.append("citations appear only in the references section")
-    if citation_rate < 0.9:
+    if has_verified_sources and citation_rate < 0.9:
         issues.append(
             f"only {len(cited_paragraphs)}/{len(paragraphs)} substantive paragraphs have inline citations"
         )

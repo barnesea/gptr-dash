@@ -60,6 +60,8 @@ class ResearchConductor:
         self._mcp_cache_lock = asyncio.Lock()
         # Track MCP query count for balanced mode
         self._mcp_query_count = 0
+        self._pending_shared_urls: set[str] = set()
+        self._owned_shared_urls: set[str] = set()
         self.last_retrieval_diagnostics: dict = {
             "candidate_count": 0,
             "selected_count": 0,
@@ -315,6 +317,7 @@ class ResearchConductor:
         self.logger.info(f"Getting context from URLs: {urls}")
         
         new_search_urls = await self._get_new_urls(urls)
+        shared_wait_urls = self._take_pending_shared_urls()
         self.logger.info(f"New URLs to process: {new_search_urls}")
 
         integrity_enabled = getattr(
@@ -322,6 +325,12 @@ class ResearchConductor:
         )
         scraped_content = await self.researcher.scraper_manager.browse_urls(
             new_search_urls, record_sources=not integrity_enabled
+        )
+        await self._publish_shared_scrapes(
+            new_search_urls, scraped_content
+        )
+        scraped_content.extend(
+            await self._collect_shared_scrapes(shared_wait_urls)
         )
         scrape_failures = list(
             getattr(
@@ -349,6 +358,7 @@ class ResearchConductor:
                     "href": alternate,
                 }
         alternate_urls = await self._get_new_urls(list(alternate_candidates))
+        alternate_wait_urls = self._take_pending_shared_urls()
         if alternate_urls:
             selected_candidates_by_url.update(
                 {
@@ -359,6 +369,9 @@ class ResearchConductor:
             )
             alternate_content = await self.researcher.scraper_manager.browse_urls(
                 alternate_urls, record_sources=not integrity_enabled
+            )
+            await self._publish_shared_scrapes(
+                alternate_urls, alternate_content
             )
             scrape_failures.extend(
                 getattr(
@@ -382,6 +395,9 @@ class ResearchConductor:
                     "accepted_before_integrity": len(alternate_content),
                 },
             )
+        scraped_content.extend(
+            await self._collect_shared_scrapes(alternate_wait_urls)
+        )
         if integrity_enabled:
             scraped_content = await self._validate_post_scrape_sources(
                 self.researcher.query,
@@ -1018,6 +1034,64 @@ class ResearchConductor:
 
         return context
 
+    async def _publish_shared_scrapes(
+        self,
+        requested_urls: list[str],
+        scraped_content: list[dict],
+    ) -> None:
+        cache = getattr(self.researcher, "shared_scrape_cache", None)
+        futures = getattr(self.researcher, "shared_scrape_futures", None)
+        if cache is None or futures is None:
+            return
+        by_url = {
+            source_url(item): dict(item)
+            for item in scraped_content
+            if source_url(item)
+        }
+        async with self.researcher.visited_urls_lock:
+            for url in requested_urls:
+                value = by_url.get(url)
+                cache[url] = value
+                future = futures.get(url)
+                if future is not None and not future.done():
+                    future.set_result(value)
+                self._owned_shared_urls.discard(url)
+
+    async def _collect_shared_scrapes(
+        self,
+        urls: set[str],
+    ) -> list[dict]:
+        cache = getattr(self.researcher, "shared_scrape_cache", None)
+        futures = getattr(self.researcher, "shared_scrape_futures", None)
+        if not urls or cache is None or futures is None:
+            return []
+        values: list[dict] = []
+        for url in sorted(urls):
+            value = cache.get(url)
+            if value is None:
+                future = futures.get(url)
+                if future is not None:
+                    value = await asyncio.shield(future)
+            if value:
+                values.append(dict(value))
+        if values:
+            self._trace(
+                "shared_scrape_cache",
+                {
+                    "requested_count": len(urls),
+                    "hit_count": len(values),
+                    "urls": sorted(
+                        source_url(item) for item in values if source_url(item)
+                    ),
+                },
+            )
+        return values
+
+    def _take_pending_shared_urls(self) -> set[str]:
+        pending = set(self._pending_shared_urls)
+        self._pending_shared_urls.clear()
+        return pending
+
     async def _get_new_urls(self, url_set_input):
         """Gets the new urls from the given url set.
         Args: url_set_input (set[str]): The url set to get the new urls from
@@ -1033,6 +1107,28 @@ class ResearchConductor:
                 if url not in self.researcher.visited_urls:
                     self.researcher.visited_urls.add(url)
                     new_urls.append(url)
+                    futures = getattr(
+                        self.researcher, "shared_scrape_futures", None
+                    )
+                    if futures is not None:
+                        future = futures.get(url)
+                        if future is None:
+                            future = asyncio.get_running_loop().create_future()
+                            futures[url] = future
+                        self._owned_shared_urls.add(url)
+                elif url not in self._owned_shared_urls:
+                    cache = getattr(
+                        self.researcher, "shared_scrape_cache", None
+                    )
+                    futures = getattr(
+                        self.researcher, "shared_scrape_futures", None
+                    )
+                    if (
+                        cache is not None
+                        and futures is not None
+                        and (url in cache or url in futures)
+                    ):
+                        self._pending_shared_urls.add(url)
         for url in new_urls:
             if self.researcher.verbose:
                 await stream_output(
@@ -1285,6 +1381,7 @@ class ResearchConductor:
         new_search_urls, prefetched_content, selected_candidates_by_url = await self._search_relevant_source_urls(
             sub_query, query_domains
         )
+        shared_wait_urls = self._take_pending_shared_urls()
         scrape_stage_started_at = time.perf_counter()
 
         # Log the research process if verbose mode is on
@@ -1300,6 +1397,12 @@ class ResearchConductor:
         integrity_enabled = getattr(self.researcher.cfg, "post_scrape_source_integrity", False)
         scraped_content = await self.researcher.scraper_manager.browse_urls(
             new_search_urls, record_sources=not integrity_enabled
+        )
+        await self._publish_shared_scrapes(
+            new_search_urls, scraped_content
+        )
+        scraped_content.extend(
+            await self._collect_shared_scrapes(shared_wait_urls)
         )
         scrape_failures = list(
             getattr(
@@ -1322,6 +1425,7 @@ class ResearchConductor:
                     "href": alternate,
                 }
         alternate_urls = await self._get_new_urls(list(alternate_candidates))
+        alternate_wait_urls = self._take_pending_shared_urls()
         if alternate_urls:
             selected_candidates_by_url.update(
                 {
@@ -1332,6 +1436,9 @@ class ResearchConductor:
             )
             alternate_content = await self.researcher.scraper_manager.browse_urls(
                 alternate_urls, record_sources=not integrity_enabled
+            )
+            await self._publish_shared_scrapes(
+                alternate_urls, alternate_content
             )
             scrape_failures.extend(
                 getattr(
@@ -1355,6 +1462,9 @@ class ResearchConductor:
                     "accepted_before_integrity": len(alternate_content),
                 },
             )
+        scraped_content.extend(
+            await self._collect_shared_scrapes(alternate_wait_urls)
+        )
 
         # Merge pre-fetched content from retrievers that already provide full text
         scraped_content.extend(prefetched_content)

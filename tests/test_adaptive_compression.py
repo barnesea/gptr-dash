@@ -80,3 +80,34 @@ async def test_unverified_fallback_page_is_not_rescued():
     assert result.rescue_used is False
     assert result.accepted_count == 0
     assert result.context == ""
+
+
+@pytest.mark.asyncio
+async def test_verified_page_uses_lexical_recovery_below_similarity_floor():
+    compressor = ContextCompressor(
+        [
+            {
+                "url": "https://www.nps.gov/example/turtles",
+                "title": "Turtle nest predators",
+                "raw_content": (
+                    "Natural predators of turtle nests and hatchlings include "
+                    "raccoons and foxes. "
+                )
+                * 80,
+            }
+        ],
+        FakeEmbeddings(),
+        similarity_threshold=0.42,
+        prompt_family=FakePrompt,
+    )
+
+    result = await compressor.async_get_context_with_diagnostics(
+        "natural predators of turtle nests and hatchlings",
+        adaptive=True,
+        rescue_floor=0.30,
+    )
+
+    assert result.top_score == pytest.approx(0.10)
+    assert result.rescue_used is True
+    assert result.rescue_mode == "verified_lexical_anchor"
+    assert result.accepted_count > 0

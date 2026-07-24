@@ -29,7 +29,10 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from ..memory.embeddings import OPENAI_EMBEDDING_MODEL
-from ..actions.source_selection import source_quality_tier
+from ..actions.source_selection import (
+    has_meaningful_query_anchor,
+    source_quality_tier,
+)
 from ..prompts import PromptFamily
 from ..utils.costs import estimate_embedding_cost
 from ..vector_store import VectorStoreWrapper
@@ -48,6 +51,7 @@ class CompressionResult:
     threshold: float
     rescue_floor: float | None
     accepted_by_source: dict[str, int]
+    rescue_mode: str = ""
 
     def diagnostics(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -277,6 +281,7 @@ class ContextCompressor:
                 threshold=self.similarity_threshold,
                 rescue_floor=None,
                 accepted_by_source={},
+                rescue_mode="",
             )
 
         source_documents = self._source_documents()
@@ -296,6 +301,7 @@ class ContextCompressor:
                 threshold=self.similarity_threshold,
                 rescue_floor=rescue_floor,
                 accepted_by_source={},
+                rescue_mode="",
             )
 
         if cost_callback:
@@ -321,6 +327,7 @@ class ContextCompressor:
         top_score = scored[0][0] if scored else 0.0
         normal = [item for item in scored if item[0] >= self.similarity_threshold]
         rescue_used = False
+        rescue_mode = ""
         candidates = normal
         per_source_cap = max(1, max_chunks_per_source)
         if not normal:
@@ -335,6 +342,31 @@ class ContextCompressor:
                 )
             ]
             per_source_cap = max(1, rescue_chunks_per_source)
+            if candidates:
+                rescue_mode = "similarity_floor"
+            else:
+                # Embedding distributions can shift by domain and chunk style.
+                # When a verified primary/reputable chunk visibly contains
+                # multiple query anchors, recover it locally rather than
+                # spending another search or returning an empty branch.
+                candidates = [
+                    item
+                    for item in scored
+                    if (
+                        item[2].metadata.get("source_tier")
+                        in {"primary", "reputable"}
+                        and has_meaningful_query_anchor(
+                            query,
+                            {
+                                "url": item[2].metadata.get("source", ""),
+                                "title": item[2].metadata.get("title", ""),
+                                "body": item[2].page_content,
+                            },
+                        )
+                    )
+                ]
+                if candidates:
+                    rescue_mode = "verified_lexical_anchor"
 
         accepted: list[Document] = []
         accepted_by_source: dict[str, int] = {}
@@ -356,6 +388,7 @@ class ContextCompressor:
             threshold=self.similarity_threshold,
             rescue_floor=rescue_floor,
             accepted_by_source=accepted_by_source,
+            rescue_mode=rescue_mode if accepted else "",
         )
 
 
