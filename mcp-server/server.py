@@ -466,6 +466,18 @@ def check_research_dependency_status() -> Dict[str, Any]:
             "deep_research_min_deepening_score": os.getenv("DEEP_RESEARCH_MIN_DEEPENING_SCORE", ""),
             "deep_research_source_standards": os.getenv("DEEP_RESEARCH_SOURCE_STANDARDS", ""),
             "deep_research_direct_url_seed": os.getenv("DEEP_RESEARCH_DIRECT_URL_SEED", ""),
+            "retrieval_pipeline_mode": os.getenv(
+                "RETRIEVAL_PIPELINE_MODE", "legacy"
+            ),
+            "source_evidence_judge_mode": os.getenv(
+                "SOURCE_EVIDENCE_JUDGE_MODE", "all"
+            ),
+            "source_evidence_judge_fallback": os.getenv(
+                "SOURCE_EVIDENCE_JUDGE_FALLBACK", "hybrid"
+            ),
+            "canonical_content_resolution": os.getenv(
+                "CANONICAL_CONTENT_RESOLUTION", "true"
+            ),
             "source_selector_mode": os.getenv("SOURCE_SELECTOR_MODE", ""),
             "research_trajectory_enabled": os.getenv("RESEARCH_TRAJECTORY_ENABLED", ""),
             "research_trajectory_dir": os.getenv("RESEARCH_TRAJECTORY_DIR", ""),
@@ -759,6 +771,43 @@ async def _run_deep_research(
         if researcher.deep_researcher:
             response["tree_policy"] = researcher.deep_researcher.tree_policy
             response["branch_mode"] = researcher.deep_researcher.branch_mode
+        candidate_snapshot = getattr(
+            researcher, "candidate_ledger_snapshot", None
+        )
+        if isinstance(candidate_snapshot, dict):
+            candidate_entries = candidate_snapshot.get("candidates") or []
+            response["retrieval_pipeline"] = {
+                "version": candidate_snapshot.get(
+                    "pipeline_version", "v2"
+                ),
+                "candidate_count": candidate_snapshot.get(
+                    "candidate_count", len(candidate_entries)
+                ),
+                "attempted_queries": candidate_snapshot.get(
+                    "attempted_queries", []
+                ),
+                "preliminary_reuse_count": sum(
+                    any(
+                        discovery.get("stage") == "preliminary"
+                        for discovery in entry.get("discoveries", [])
+                    )
+                    and bool(entry.get("assigned_aspects"))
+                    for entry in candidate_entries
+                ),
+                "resolver_attempt_count": sum(
+                    len(entry.get("fetch_attempts", []))
+                    for entry in candidate_entries
+                ),
+                "evidence_judgment_count": sum(
+                    len(entry.get("judgments", []))
+                    for entry in candidate_entries
+                ),
+                "judge_fallback_count": sum(
+                    bool(judgment.get("fallback"))
+                    for entry in candidate_entries
+                    for judgment in entry.get("judgments", [])
+                ),
+            }
         if researcher.trajectory:
             response["trajectory_id"] = researcher.trajectory.job_id
         # A UUID is too easy for a chat model to transcribe incorrectly.  The

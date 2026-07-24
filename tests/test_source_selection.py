@@ -109,7 +109,7 @@ def test_selector_auto_skips_llm_for_decisive_fallback_score_gap():
     assert not should_use_model_selector(query, candidates, "auto")
 
 
-def test_predation_query_prefers_answer_bearing_reputable_source():
+def test_v2_role_mix_retains_directly_answer_bearing_secondary_source():
     candidates = [
         {
             "href": "https://www.fisheries.noaa.gov/species/hawksbill-turtle",
@@ -125,14 +125,17 @@ def test_predation_query_prefers_answer_bearing_reputable_source():
             "body": "Sharks and killer whales prey on adult sea turtles.",
         },
     ]
+    candidates[0]["_gptr_evidence_role"] = "original"
+    candidates[1]["_gptr_evidence_role"] = "reputable_secondary"
     selected, _ = deterministic_select_sources(
         "natural predators of sea turtles by life stage",
         candidates,
-        1,
+        2,
         strict=True,
     )
-    assert source_url(selected[0]).startswith(
-        "https://www.seaturtlestatus.org/"
+    assert any(
+        source_url(item).startswith("https://www.seaturtlestatus.org/")
+        for item in selected
     )
 from gpt_researcher.prompts import PromptFamily
 

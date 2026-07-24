@@ -192,6 +192,9 @@ def report_quality_diagnostics(
                 ):
                     unsupported_scope_claims.append(str(anchor))
                     break
+    # Preserve the existing high-confidence taxonomy guard while the v2
+    # evidence judge handles arbitrary requested relationships. This is a
+    # compatibility safety net, not part of retrieval ranking.
     category_error = False
     predator_immunity_overclaim = False
     if re.search(r"\bpredators?\b", query, re.IGNORECASE):
@@ -278,9 +281,9 @@ Rules:
 - State unresolved scope as an explicit evidence limitation.
 - Do not call fallback sources primary.
 - Do not generalize beyond matched scope anchors.
-- Keep diseases, parasites, microbes, and environmental hazards separate from
-  predators. Describe defenses as reducing vulnerability or predation risk;
-  never call an animal immune to predators.
+- Preserve the relationship and category asked by the user. Keep adjacent
+  causes, effects, risks, mitigations, and correlations separate unless
+  judge-approved evidence explicitly supports the classification.
 - Put an inline Markdown citation at the end of every substantive evidence
   paragraph, using only exact URLs from the allowlist.
 - Return only the corrected Markdown report.
@@ -620,9 +623,9 @@ Evidence-safety requirements:
 - Never call fallback evidence primary evidence.
 - Do not generalize beyond matched_scope_anchors.
 - Do not claim the report is comprehensive when any aspect is unresolved.
-- Keep diseases, parasites, microbes, and environmental hazards separate from
-  predators. Describe defenses as reducing vulnerability or predation risk;
-  never call an animal immune to predators.
+- Preserve the relationship and category asked by the user. Keep adjacent
+  causes, effects, risks, mitigations, and correlations separate unless
+  judge-approved evidence explicitly supports the classification.
 - Every substantive evidence paragraph must end with an inline citation.
 """
     

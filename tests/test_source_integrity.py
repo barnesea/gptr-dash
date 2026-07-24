@@ -67,7 +67,7 @@ def test_post_scrape_integrity_rejects_redirected_off_topic_page():
     assert reason == "post-scrape reject: fetched page has no meaningful query-anchor coverage"
 
 
-def test_post_scrape_integrity_requires_requested_predation_evidence():
+def test_post_scrape_integrity_leaves_relationship_judgment_to_generic_judge():
     candidate = _card(
         "https://www.fisheries.noaa.gov/species/hawksbill-turtle",
         "Hawksbill Turtle",
@@ -86,7 +86,7 @@ def test_post_scrape_integrity_requires_requested_predation_evidence():
         candidate,
         scraped,
     )
-    assert "requested predation relationship" in reason
+    assert reason is None
 
 
 def test_post_scrape_integrity_checks_scholarly_content_after_long_header():

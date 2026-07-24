@@ -56,6 +56,37 @@ def test_aspect_plan_preserves_required_scope_anchors():
     ]
 
 
+def test_aspect_plan_preserves_v2_retrieval_contract():
+    response = """{"aspects":[{
+      "id":"workflow","priority":1,"intent":"procedural",
+      "question":"How is Krea 2 style LoRA training performed?",
+      "search_query":"Krea 2 Ostris AI Toolkit style LoRA training",
+      "entities":[
+        {"name":"Krea 2","aliases":["Krea2"],"exact":true},
+        {"name":"Ostris AI Toolkit","aliases":["ai-toolkit"],"exact":true}
+      ],
+      "relation":"style LoRA training workflow",
+      "evidence_roles":["first_party","practitioner"],
+      "expected_evidence_type":"official workflow and practical corroboration",
+      "original_query_anchors":["Krea 2","Ostris AI Toolkit"],
+      "required_scope_anchors":[]
+    }]}"""
+
+    plan = parse_aspect_plan_response(
+        response,
+        1,
+        "How do I train a style LoRA for Krea 2 with Ostris AI Toolkit?",
+    )
+
+    assert plan[0]["intent"] == "procedural"
+    assert plan[0]["entities"][0]["aliases"] == ["Krea2"]
+    assert plan[0]["relation"] == "style LoRA training workflow"
+    assert plan[0]["evidence_roles"] == [
+        "first_party",
+        "practitioner",
+    ]
+
+
 def test_aspect_plan_excludes_generic_dimensions_from_scope_anchors():
     response = """{"aspects":[{
       "id":"taxa","priority":1,
@@ -178,7 +209,20 @@ def test_box_turtle_predation_satisfies_terrestrial_turtle_scope():
         diagnostics,
         aspect={
             "question": "What are predators of terrestrial turtles?",
+            "relation": "predation",
             "required_scope_anchors": ["terrestrial turtles", "turtle nests"],
+            "entities": [
+                {
+                    "name": "terrestrial turtles",
+                    "aliases": ["box turtle"],
+                    "exact": True,
+                },
+                {
+                    "name": "turtle nests",
+                    "aliases": ["box turtle nests"],
+                    "exact": True,
+                },
+            ],
         },
     )
     assert state == "evidence_ready"
@@ -268,7 +312,7 @@ async def test_scope_repair_targets_only_missing_anchor(monkeypatch):
     )
 
     assert query == (
-        "natural predators of terrestrial turtles primary scholarly evidence"
+        '"terrestrial turtles" natural predators primary study'
     )
     assert "freshwater" not in query
 

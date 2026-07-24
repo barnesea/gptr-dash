@@ -3,21 +3,39 @@
 from __future__ import annotations
 
 from collections import Counter
+import math
 import re
 from typing import Any
 import unicodedata
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
+
+from .retrieval_pipeline import (
+    canonicalize_url,
+    evidence_role,
+    meaningful_tokens,
+)
 
 
 LOW_VALUE_HOST_MARKERS = (
     "dictionary.", "merriam-webster.", "vocabulary.com", "thesaurus.",
     "diffchecker.", "textcompare.", "text-compare.", "draftable.",
-    # Deep research may use a broader-web fallback, never generic social or
-    # self-published aggregation pages as evidence.
-    "medium.com", "linkedin.com", "facebook.com", "instagram.com",
-    "youtube.com", "youtu.be", "twitter.com", "tiktok.com",
-    "reddit.com", "quora.com", "pinterest.com",
-    "articsledge.com", "dev.to", "substack.com", "hashnode.",
+    "pinterest.com", "articsledge.com",
+)
+LEGACY_LOW_VALUE_HOST_MARKERS = (
+    *LOW_VALUE_HOST_MARKERS,
+    "medium.com",
+    "linkedin.com",
+    "facebook.com",
+    "instagram.com",
+    "youtube.com",
+    "youtu.be",
+    "twitter.com",
+    "tiktok.com",
+    "reddit.com",
+    "quora.com",
+    "dev.to",
+    "substack.com",
+    "hashnode.",
 )
 LOW_VALUE_EXACT_HOSTS = ("x.com",)
 NAMED_SOCIAL_HOSTS = {
@@ -61,8 +79,7 @@ REPUTABLE_TECH_HOST_MARKERS = (
 REPUTABLE_GENERAL_HOST_MARKERS = (
     "si.edu", "smithsonian", "museum", "aquarium", "university",
     "nationalgeographic.com", "bbc.com", "bbc.co.uk", "reuters.com",
-    "apnews.com", "seaturtlestatus.org", "conserveturtles.org",
-    "turtle-foundation.org", "iucn.org", "wwf.org",
+    "apnews.com", "iucn.org", "wwf.org",
 )
 SUSPICIOUS_SCRAPED_TITLES = (
     "set your api key", "access denied", "just a moment", "sign in", "signin",
@@ -74,41 +91,37 @@ AUTH_PATH_SEGMENTS = {
     "signup",
 }
 AUTH_HOST_PREFIXES = ("account.", "accounts.", "auth.", "login.")
-CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+CAMEL_BOUNDARY = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z][a-z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
 TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
 URL_PATTERN = re.compile(r"https?://[^\s\]\)>\",;]+", re.IGNORECASE)
-PREDATION_QUERY_PATTERN = re.compile(
-    r"\b(?:predators?|predation|prey|what eats|natural enemies)\b",
-    re.IGNORECASE,
-)
-PREDATION_EVIDENCE_PATTERN = re.compile(
-    r"\b(?:predators?|predation|prey|eats?|eaten|feeds? on|natural enemies)\b",
-    re.IGNORECASE,
-)
-TURTLE_TARGET_PATTERN = re.compile(
-    r"\b(?:sea turtles?|freshwater turtles?|terrestrial turtles?|"
-    r"land turtles?|box turtles?|tortoises?|turtle (?:eggs?|nests?|"
-    r"hatchlings?|juveniles?|adults?))\b",
-    re.IGNORECASE,
-)
-CONCRETE_PREDATION_PATTERN = re.compile(
-    r"(?:"
-    r"\bpredators?\b.{0,100}\b(?:include|including|such as|are|is|:)\b"
-    r"|\b(?:include|including|such as)\b.{0,100}\bpredators?\b"
-    r"|\b(?:preyed (?:on|upon) by|eaten by)\b"
-    r"|\b(?:preys? (?:on|upon)|eats?|feeds? on)\b"
-    r"|\b(?:is|are)\b.{0,50}\b(?:turtle )?predators?\b"
-    r")",
-    re.IGNORECASE,
-)
-
-
 def source_url(candidate: dict[str, Any]) -> str:
     return str(candidate.get("href") or candidate.get("url") or "").strip()
 
 
 def source_domain(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+def source_site(url: str) -> str:
+    """Return a conservative registrable-site key for corroboration."""
+    domain = source_domain(url)
+    labels = [label for label in domain.split(".") if label]
+    if len(labels) <= 2:
+        return domain
+    multipart_suffixes = {
+        "co.uk",
+        "com.au",
+        "com.br",
+        "com.cn",
+        "com.sg",
+        "co.jp",
+        "co.nz",
+        "org.uk",
+    }
+    suffix = ".".join(labels[-2:])
+    return ".".join(labels[-3:]) if suffix in multipart_suffixes else suffix
 
 
 def extract_query_urls(query: str) -> list[str]:
@@ -124,18 +137,48 @@ def extract_query_urls(query: str) -> list[str]:
 
 
 def canonical_source_alternatives(url: str) -> list[str]:
-    """Return bounded canonical/raw/PDF variants after a selected URL fails."""
+    """Return bounded keyless raw/API/PDF variants for supported source types."""
     parsed = urlparse(url)
     domain = source_domain(url)
     path = parsed.path
     alternatives: list[str] = []
-    if domain == "github.com" and "/blob/" in path:
-        before, after = path.split("/blob/", 1)
-        alternatives.append(
-            f"https://raw.githubusercontent.com{before}/{after}"
-        )
-    elif domain == "huggingface.co" and "/blob/" in path:
-        alternatives.append(url.replace("/blob/", "/resolve/", 1))
+    segments = [segment for segment in path.split("/") if segment]
+    if domain == "github.com":
+        if "/blob/" in path:
+            before, after = path.split("/blob/", 1)
+            alternatives.append(
+                f"https://raw.githubusercontent.com{before}/{after}"
+            )
+        elif len(segments) == 2:
+            owner, repository = segments
+            alternatives.extend(
+                [
+                    f"https://raw.githubusercontent.com/{owner}/{repository}/main/README.md",
+                    f"https://raw.githubusercontent.com/{owner}/{repository}/master/README.md",
+                ]
+            )
+    elif domain == "gitlab.com" and len(segments) >= 2:
+        owner, repository = segments[:2]
+        if "/-/blob/" in path:
+            alternatives.append(url.replace("/-/blob/", "/-/raw/", 1))
+        elif len(segments) == 2:
+            alternatives.append(
+                f"https://gitlab.com/{owner}/{repository}/-/raw/main/README.md"
+            )
+    elif domain == "huggingface.co":
+        if "/blob/" in path:
+            alternatives.append(url.replace("/blob/", "/resolve/", 1))
+        elif len(segments) >= 2 and segments[0] not in {"docs", "blog", "t"}:
+            if segments[0] in {"datasets", "spaces"} and len(segments) >= 3:
+                prefix, owner, repository = segments[:3]
+                alternatives.append(
+                    f"https://huggingface.co/{prefix}/{owner}/{repository}/resolve/main/README.md"
+                )
+            else:
+                owner, repository = segments[:2]
+                alternatives.append(
+                    f"https://huggingface.co/{owner}/{repository}/resolve/main/README.md"
+                )
     elif domain == "arxiv.org" and path.startswith("/abs/"):
         identifier = path.removeprefix("/abs/").strip("/")
         if identifier:
@@ -145,11 +188,36 @@ def canonical_source_alternatives(url: str) -> list[str]:
                     f"https://arxiv.org/pdf/{identifier}",
                 ]
             )
+    elif domain == "doi.org":
+        identifier = path.strip("/")
+        if identifier:
+            encoded = quote(identifier, safe="")
+            alternatives.extend(
+                [
+                    f"https://api.crossref.org/works/{encoded}",
+                    "https://api.openalex.org/works/"
+                    f"https://doi.org/{identifier}",
+                ]
+            )
+    elif (
+        domain == "pmc.ncbi.nlm.nih.gov"
+        and len(segments) >= 2
+        and segments[0] == "articles"
+    ):
+        identifier = segments[1]
+        alternatives.extend(
+            [
+                f"https://pmc.ncbi.nlm.nih.gov/articles/{identifier}/?report=reader",
+                f"https://pmc.ncbi.nlm.nih.gov/articles/{identifier}/pdf/",
+            ]
+        )
     seen: set[str] = set()
+    canonical_original = canonicalize_url(url)
     return [
         candidate
         for candidate in alternatives
-        if candidate != url and not (candidate in seen or seen.add(candidate))
+        if canonicalize_url(candidate) != canonical_original
+        and not (candidate in seen or seen.add(candidate))
     ][:2]
 
 
@@ -176,11 +244,24 @@ def source_quality_tier(
     candidate: dict[str, Any],
     query: str = "",
 ) -> str:
-    """Classify a result card without trusting its prose or model judgment."""
-    domain = source_domain(source_url(candidate))
+    """Map aspect-relative evidence roles onto the legacy tier vocabulary."""
     internal_tier = str(candidate.get("_gptr_source_tier") or "")
     if internal_tier in {"primary", "reputable", "fallback", "reject"}:
         return internal_tier
+    internal_role = str(candidate.get("_gptr_evidence_role") or "")
+    if internal_role:
+        return {
+            "first_party": "primary",
+            "original": "primary",
+            "reputable_secondary": "reputable",
+            "practitioner": "fallback",
+            "reject": "reject",
+        }.get(internal_role, "fallback")
+    # Unstamped candidates use the established legacy classifier. The v2
+    # pipeline stamps an aspect-relative role before ranking, so rollback mode
+    # retains its exact behavior while neutral hosts such as GitHub and
+    # Hugging Face are no longer inherently first-party in v2.
+    domain = source_domain(source_url(candidate))
     padded_query = f" {str(query).lower()} "
     for social_host, names in NAMED_SOCIAL_HOSTS.items():
         if (
@@ -189,7 +270,7 @@ def source_quality_tier(
             return "primary"
     if (
         not domain
-        or any(marker in domain for marker in LOW_VALUE_HOST_MARKERS)
+        or any(marker in domain for marker in LEGACY_LOW_VALUE_HOST_MARKERS)
         or any(
             domain == host or domain.endswith(f".{host}")
             for host in LOW_VALUE_EXACT_HOSTS
@@ -240,17 +321,6 @@ def post_scrape_integrity_reason(
     }
     if not has_meaningful_query_anchor(query, content_card):
         return "post-scrape reject: fetched page has no meaningful query-anchor coverage"
-    if (
-        PREDATION_QUERY_PATTERN.search(query or "")
-        and not PREDATION_EVIDENCE_PATTERN.search(
-            f"{scraped.get('title', '')} {raw_content}"
-        )
-    ):
-        return (
-            "post-scrape reject: fetched page covers the subject but not "
-            "the requested predation relationship"
-        )
-
     # A SERP title and a fetched title normally share at least one distinctive
     # term.  Do not reject pages with no usable title (PDFs often lack one), but
     # reject a wholly unrelated fetched title when the original card was clear.
@@ -260,7 +330,11 @@ def post_scrape_integrity_reason(
             expected_tokens = _anchor_tokens(expected_title) - GENERIC_QUERY_ANCHORS
             fetched_tokens = _anchor_tokens(title) - GENERIC_QUERY_ANCHORS
             if len(expected_tokens) >= 2 and not (expected_tokens & fetched_tokens):
-                return "post-scrape reject: fetched title does not match the selected search result"
+                # Dynamic repository/model-card pages routinely expose a
+                # generic fetched title while their canonical path and body are
+                # correct. Treat title divergence as a soft signal after the
+                # content itself passed the query-anchor guard.
+                candidate["_gptr_title_mismatch"] = True
     return None
 
 
@@ -282,6 +356,15 @@ def source_card(candidate: dict[str, Any], source_id: int) -> dict[str, Any]:
         "engine": str(candidate.get("engine") or "").strip()[:80],
         "date": str(candidate.get("date") or "").strip()[:80],
         "source_tier": source_quality_tier(candidate),
+        "evidence_role": str(
+            candidate.get("_gptr_evidence_role")
+            or {
+                "primary": "original",
+                "reputable": "reputable_secondary",
+                "fallback": "practitioner",
+                "reject": "reject",
+            }[source_quality_tier(candidate)]
+        ),
     }
 
 
@@ -337,77 +420,141 @@ def has_requested_evidence_relation(
     text: str,
     *,
     required_scope_anchors: list[str] | None = None,
+    relation: str = "",
+    entity_anchors: list[dict[str, Any] | str] | None = None,
 ) -> bool:
-    """Verify supported query relationships in retained evidence.
+    """Verify entity/relation/scope co-occurrence without topic rules.
 
-    This deliberately handles only relationships with a safe deterministic
-    rule. Unsupported query types return True and continue to rely on semantic
-    retrieval plus scope checks.
+    This is deliberately conservative and backs up the model judge only when
+    that judge fails. A normal v2 result is accepted from structured judgment,
+    not from this lexical approximation.
     """
-    if not PREDATION_QUERY_PATTERN.search(query or ""):
-        return True
+    normalized_entities: list[list[str]] = []
+    entity_alias_groups: list[tuple[str, list[str]]] = []
+    entity_tokens: set[str] = set()
+    for value in entity_anchors or []:
+        if isinstance(value, dict):
+            name = str(value.get("name") or "").strip()
+            aliases = [
+                str(alias).strip()
+                for alias in value.get("aliases") or []
+                if str(alias).strip()
+            ]
+            exact = bool(value.get("exact", True))
+        else:
+            name = str(value or "").strip()
+            aliases = []
+            exact = True
+        if name:
+            if exact:
+                normalized_entities.append([name, *aliases])
+            entity_alias_groups.append((name, aliases))
+            entity_tokens.update(meaningful_tokens(name))
+
+    query_tokens = set(meaningful_tokens(query)) - GENERIC_QUERY_ANCHORS
+    relation_tokens = [
+        token
+        for token in meaningful_tokens(relation or query)
+        if token not in GENERIC_QUERY_ANCHORS and token not in entity_tokens
+    ]
+
+    def token_matches(token: str, paragraph_tokens: set[str]) -> bool:
+        variants = _token_variants(token)
+        return any(
+            candidate in variants
+            or any(
+                len(candidate) >= 6
+                and len(variant) >= 6
+                and candidate[:5] == variant[:5]
+                for variant in variants
+            )
+            for candidate in paragraph_tokens
+        )
+
+    def relation_matches(paragraph: str) -> bool:
+        paragraph_tokens = set(meaningful_tokens(paragraph))
+        if relation:
+            if not relation_tokens:
+                return True
+            matched = sum(
+                token_matches(token, paragraph_tokens)
+                for token in relation_tokens
+            )
+            minimum = min(
+                3,
+                max(1, math.ceil(len(set(relation_tokens)) * 0.4)),
+            )
+            core = list(dict.fromkeys(relation_tokens))[:2]
+            return matched >= minimum and any(
+                token_matches(token, paragraph_tokens) for token in core
+            )
+        minimum_overlap = min(3, max(2, len(query_tokens)))
+        return (
+            sum(
+                token_matches(token, paragraph_tokens)
+                for token in query_tokens
+            )
+            >= minimum_overlap
+        )
+
+    padded_text = f" {str(text or '').lower()} "
+    compact_text = re.sub(r"[^a-z0-9]+", "", padded_text)
+    for entity_group in normalized_entities:
+        if not any(
+            (
+                " ".join(entity.lower().split()) in padded_text
+                or re.sub(r"[^a-z0-9]+", "", entity.lower())
+                in compact_text
+            )
+            for entity in entity_group
+            if entity
+        ):
+            # Exact named entities are a safety guard against generic verb
+            # collisions such as a training query returning transportation.
+            return False
 
     paragraphs = [
         paragraph.strip()
         for paragraph in re.split(r"\n\s*\n|(?<=[.!?])\s+", text or "")
         if paragraph.strip()
     ]
-    claims = [
-        paragraph
-        for paragraph in paragraphs
-        if TURTLE_TARGET_PATTERN.search(paragraph)
-        and PREDATION_EVIDENCE_PATTERN.search(paragraph)
-        and CONCRETE_PREDATION_PATTERN.search(paragraph)
-    ]
-    if not claims:
-        return False
     if not required_scope_anchors:
-        return True
+        return any(relation_matches(paragraph) for paragraph in paragraphs)
+
+    def aliases_for_scope(anchor: str) -> list[str]:
+        anchor_tokens = set(meaningful_tokens(anchor))
+        values = [anchor]
+        for name, aliases in entity_alias_groups:
+            if anchor_tokens & set(meaningful_tokens(name)):
+                values.extend(aliases)
+        return list(dict.fromkeys(values))
 
     return all(
         any(
-            scope_anchor_matches_text(anchor, claim)
-            for claim in claims
+            any(
+                scope_anchor_matches_text(alias, paragraph)
+                for alias in aliases_for_scope(anchor)
+            )
+            and relation_matches(paragraph)
+            for paragraph in paragraphs
         )
         for anchor in required_scope_anchors
     )
 
 
 def scope_anchor_patterns(anchor: str) -> tuple[str, ...]:
-    """Return conservative lexical aliases for one scope category."""
+    """Return conservative, topic-neutral lexical variants for one scope."""
     normalized = " ".join(str(anchor).lower().split())
-    if "adult sea turtle" in normalized:
-        return (
-            r"\badult sea turtles?\b",
-            r"\badult marine turtles?\b",
-        )
-    if "juvenile sea turtle" in normalized:
-        return (
-            r"\bjuvenile sea turtles?\b",
-            r"\bjuvenile marine turtles?\b",
-            r"\bsea turtle (?:juveniles?|hatchlings?)\b",
-        )
-    if "terrestrial turtle" in normalized:
-        return (
-            r"\bterrestrial turtles?\b",
-            r"\bland turtles?\b",
-            r"\btortoises?\b",
-            r"\bbox turtles?\b",
-        )
-    if "freshwater turtle" in normalized:
-        return (
-            r"\bfreshwater turtles?\b",
-            r"\bpond turtles?\b",
-            r"\briver turtles?\b",
-        )
-    if "sea turtle" in normalized:
-        return (r"\bsea turtles?\b", r"\bmarine turtles?\b")
-    if "turtle nest" in normalized:
-        return (
-            r"\bturtle nests?\b",
-            r"\bturtle (?:eggs?|clutches?)\b",
-        )
-    return (rf"\b{re.escape(normalized)}\b",)
+    if not normalized:
+        return ()
+    values = {normalized, normalized.replace("-", " "), normalized.replace(" ", "-")}
+    if normalized.endswith("ies"):
+        values.add(f"{normalized[:-3]}y")
+    elif normalized.endswith("s") and len(normalized) > 4:
+        values.add(normalized[:-1])
+    else:
+        values.add(f"{normalized}s")
+    return tuple(rf"\b{re.escape(value)}\b" for value in sorted(values))
 
 
 def scope_anchor_matches_text(anchor: str, text: str) -> bool:
@@ -419,8 +566,8 @@ def scope_anchor_matches_text(anchor: str, text: str) -> bool:
 
 
 def requires_supported_evidence_relation(query: str) -> bool:
-    """Return whether deterministic relationship validation applies."""
-    return bool(PREDATION_QUERY_PATTERN.search(query or ""))
+    """Return whether a query has enough content terms for generic promotion."""
+    return len(set(meaningful_tokens(query)) - GENERIC_QUERY_ANCHORS) >= 2
 
 
 def _candidate_score(
@@ -445,11 +592,7 @@ def _candidate_score(
         "fallback": 0,
         "reject": -10,
     }[tier]
-    if (
-        PREDATION_QUERY_PATTERN.search(query or "")
-        and not PREDATION_EVIDENCE_PATTERN.search(haystack)
-    ):
-        score -= 12
+    score += round(float(candidate.get("_gptr_semantic_score") or 0.0) * 6)
     domain = source_domain(source_url(candidate))
     if (
         domain == "doi.org"
@@ -484,23 +627,37 @@ def deterministic_select_sources(
         scored.append((score, -index, candidate, reason, tier))
 
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    v2_roles_present = any(
+        bool(candidate.get("_gptr_evidence_role")) for candidate in candidates
+    )
+    qualified_higher_tier_exists = any(
+        tier in {"primary", "reputable"}
+        and has_meaningful_query_anchor(query, candidate)
+        for _, _, candidate, _, tier in scored
+    )
     selected: list[dict[str, Any]] = []
     reasons: dict[str, str] = {}
     domains: Counter[str] = Counter()
     selected_urls: set[str] = set()
-    has_higher_tier = any(tier in {"primary", "reputable"} and has_meaningful_query_anchor(query, candidate)
-                          for _, _, candidate, _, tier in scored)
     for score, _, candidate, reason, tier in scored:
         url = source_url(candidate)
         domain = source_domain(url)
         if tier == "reject":
             reasons[url] = "deterministic reject: low-value utility, dictionary, or comparison result"
             continue
+        if (
+            strict
+            and not v2_roles_present
+            and tier == "fallback"
+            and qualified_higher_tier_exists
+        ):
+            reasons[url] = (
+                "deterministic reject: fallback is unnecessary when a "
+                "qualified primary or reputable source is available"
+            )
+            continue
         if strict and not has_meaningful_query_anchor(query, candidate):
             reasons[url] = "deterministic reject: no meaningful query-anchor coverage"
-            continue
-        if strict and tier == "fallback" and has_higher_tier:
-            reasons[url] = "deterministic reject: broader-web fallback is unnecessary"
             continue
         if score < 0 and selected:
             reasons[url] = "deterministic reject: low source-quality score"
@@ -515,15 +672,125 @@ def deterministic_select_sources(
             reasons[url] = "deterministic reject: duplicate domain; preserving source diversity"
             continue
         selected.append(candidate)
+        if not candidate.get("_gptr_evidence_role"):
+            candidate["_gptr_evidence_role"] = {
+                "primary": "original",
+                "reputable": "reputable_secondary",
+                "fallback": "practitioner",
+                "reject": "reject",
+            }[tier]
         selected_urls.add(url)
         domains[domain] += 1
-        reasons[url] = reason
+        reasons[url] = (
+            f"{reason}; evidence role={candidate['_gptr_evidence_role']}"
+        )
 
     for candidate in candidates:
         url = source_url(candidate)
         if url and url not in reasons:
             reasons[url] = "fallback: duplicate URL"
     return selected, reasons
+
+
+def rebalance_evidence_roles(
+    query: str,
+    candidates: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    required_roles: list[str],
+    max_sources: int,
+) -> list[dict[str, Any]]:
+    """Preserve the best available functional evidence mix within the cap."""
+    required = [
+        role
+        for role in required_roles
+        if role
+        in {
+            "first_party",
+            "original",
+            "reputable_secondary",
+            "practitioner",
+        }
+    ]
+    if not required or max_sources <= 0:
+        return selected[: max(0, max_sources)]
+
+    def role_of(candidate: dict[str, Any]) -> str:
+        return str(
+            candidate.get("_gptr_evidence_role")
+            or evidence_role(candidate, query=query)
+        )
+
+    def satisfies(candidate: dict[str, Any], role: str) -> bool:
+        actual = role_of(candidate)
+        return (
+            actual == role
+            or (role == "first_party" and actual == "original")
+            or (
+                role == "practitioner"
+                and actual == "reputable_secondary"
+            )
+        )
+
+    def covers(values: list[dict[str, Any]], role: str) -> bool:
+        return any(satisfies(value, role) for value in values)
+
+    ranked = sorted(
+        [
+            candidate
+            for candidate in candidates
+            if source_quality_tier(candidate, query) != "reject"
+            and has_meaningful_query_anchor(query, candidate)
+        ],
+        key=lambda candidate: (
+            -_candidate_score(
+                query,
+                candidate,
+                candidates.index(candidate),
+            )[0],
+            candidates.index(candidate),
+        ),
+    )
+    balanced = list(selected[:max_sources])
+    for role in required:
+        if covers(balanced, role):
+            continue
+        selected_sites = {
+            source_site(source_url(candidate))
+            for candidate in balanced
+            if source_url(candidate)
+        }
+        options = [
+            candidate
+            for candidate in ranked
+            if candidate not in balanced and satisfies(candidate, role)
+        ]
+        options.sort(
+            key=lambda candidate: (
+                source_site(source_url(candidate)) in selected_sites,
+                ranked.index(candidate),
+            )
+        )
+        option = next(iter(options), None)
+        if option is None:
+            continue
+        if len(balanced) < max_sources:
+            balanced.append(option)
+            continue
+        protected_roles = [
+            value
+            for value in required
+            if value != role and covers(balanced, value)
+        ]
+        for index in range(len(balanced) - 1, -1, -1):
+            trial = [
+                value
+                for position, value in enumerate(balanced)
+                if position != index
+            ]
+            if all(covers(trial, value) for value in protected_roles):
+                balanced[index] = option
+                break
+    return balanced
 
 
 def should_use_model_selector(query: str, candidates: list[dict[str, Any]], mode: str) -> bool:

@@ -91,6 +91,10 @@ class GPTResearcher:
         trajectory_node_id: str = "root",
         trajectory_parent_node_id: str | None = None,
         research_policy: ResearchPolicy | None = None,
+        candidate_ledger: Any | None = None,
+        seed_candidates: list[dict[str, Any]] | None = None,
+        research_aspect: dict[str, Any] | None = None,
+        excluded_candidate_urls: list[str] | None = None,
         **kwargs
     ):
         """
@@ -156,6 +160,12 @@ class GPTResearcher:
         self.cfg = Config(config_path)
         self.cfg.set_verbose(verbose)
         self.research_policy = research_policy
+        self.candidate_ledger = candidate_ledger
+        self.seed_candidates = list(seed_candidates or [])
+        self.research_aspect = dict(research_aspect or {})
+        self.excluded_candidate_urls = set(
+            excluded_candidate_urls or []
+        )
         self.coverage_ledger: list[dict[str, Any]] = []
         self._owns_trajectory = False
         if (

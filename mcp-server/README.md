@@ -52,6 +52,18 @@ Optional GPT Researcher settings such as `OPENAI_BASE_URL`,
 `LANGCHAIN_API_KEY`, retriever settings, and model configuration are inherited
 from the same environment.
 
+For the evidence-led retrieval path used by the Komodo stack:
+
+```bash
+GPTR_RETRIEVAL_PIPELINE_MODE=v2
+GPTR_SOURCE_EVIDENCE_JUDGE_MODE=all
+GPTR_SOURCE_EVIDENCE_JUDGE_FALLBACK=hybrid
+GPTR_CANONICAL_CONTENT_RESOLUTION=true
+```
+
+Use `GPTR_RETRIEVAL_PIPELINE_MODE=legacy` as the immediate rollback. The MCP
+tool signature remains `deep_research(query, research_duration_seconds=60)`.
+
 ## Tools
 
 - `deep_research`: conduct deep web research and return context plus sources.

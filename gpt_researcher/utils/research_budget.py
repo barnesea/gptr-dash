@@ -18,8 +18,8 @@ MAX_RESEARCH_DURATION_SECONDS = 600
 MAX_CALIBRATED_ASPECTS = 6
 MAX_CALIBRATED_REPAIRS = 8
 MAX_CALIBRATED_DEEPENED_BRANCHES = 4
-POLICY_SCHEMA_VERSION = 2
-CALIBRATION_FORMAT_VERSION = 2
+POLICY_SCHEMA_VERSION = 3
+CALIBRATION_FORMAT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -127,13 +127,15 @@ def cold_start_policy(duration: int, *, concurrency_limit: int = 4) -> ResearchP
         estimated_research_seconds=float(duration),
         estimated_stage_seconds={
             "planning": round(duration * 0.12, 3),
-            "search": round(duration * 0.14, 3),
-            "selection": round(duration * 0.04, 3),
-            "scraping": round(duration * 0.28, 3),
-            "compression": round(duration * 0.14, 3),
-            "repairs": round(duration * (0.12 if repair_allowance else 0.0), 3),
+            "search": round(duration * 0.12, 3),
+            "selection": round(duration * 0.03, 3),
+            "scraping": round(duration * 0.23, 3),
+            "resolution": round(duration * 0.05, 3),
+            "compression": round(duration * 0.12, 3),
+            "evidence_judgment": round(duration * 0.12, 3),
+            "repairs": round(duration * (0.10 if repair_allowance else 0.0), 3),
             "deepening": round(
-                duration * (0.16 if max_deepened_branches else 0.0), 3
+                duration * (0.11 if max_deepened_branches else 0.0), 3
             ),
             "reporting": 0.0,
         },
@@ -152,6 +154,18 @@ def research_stack_fingerprint(cfg: Any) -> str:
         "scraper": getattr(cfg, "scraper", ""),
         "concurrency": int(getattr(cfg, "deep_research_concurrency", 4)),
         "source_selector_mode": getattr(cfg, "source_selector_mode", "auto"),
+        "retrieval_pipeline_mode": getattr(
+            cfg, "retrieval_pipeline_mode", "legacy"
+        ),
+        "source_evidence_judge_mode": getattr(
+            cfg, "source_evidence_judge_mode", "all"
+        ),
+        "source_evidence_judge_fallback": getattr(
+            cfg, "source_evidence_judge_fallback", "hybrid"
+        ),
+        "canonical_content_resolution": bool(
+            getattr(cfg, "canonical_content_resolution", True)
+        ),
         "pdf_connect_timeout": float(
             getattr(cfg, "deep_research_pdf_connect_timeout_seconds", 3.0)
         ),

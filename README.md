@@ -106,6 +106,13 @@ When `RESEARCH_TRAJECTORY_ENABLED=true`, each MCP job writes an append-only
 JSONL trace beneath the configured persistent `RESEARCH_TRAJECTORY_DIR`; use
 `evals/trajectory_compare.py` to summarize multiple policy runs.
 
+The homelab stack enables the generalized retrieval pipeline with
+`GPTR_RETRIEVAL_PIPELINE_MODE=v2`. It keeps preliminary result cards in a
+job-wide candidate ledger, renders compact entity-first queries, resolves
+canonical raw/API/PDF variants, and batches every hard-valid fetched source
+through an evidence judge before synthesis. Set the mode to `legacy` for an
+immediate retrieval rollback.
+
 ## ⚙️ Getting Started
 
 ### Installation
@@ -246,6 +253,20 @@ requested research duration.
 - 🛡️ Verified primary/reputable evidence and corroborated broader-web fallback
 - ⚡️ Shared concurrency of four across focused branches
 - 📈 Job trajectories with timing calibration and compression diagnostics
+
+The v2 production switches are:
+
+```text
+GPTR_RETRIEVAL_PIPELINE_MODE=v2
+GPTR_SOURCE_EVIDENCE_JUDGE_MODE=all
+GPTR_SOURCE_EVIDENCE_JUDGE_FALLBACK=hybrid
+GPTR_CANONICAL_CONTENT_RESOLUTION=true
+```
+
+`hybrid` retries malformed evidence-judge output once, then accepts only
+strongly entity/relation-anchored primary evidence or independently
+corroborated practitioner evidence. Set the retrieval mode to `legacy` without
+changing the public MCP interface.
 
 Production defaults to `RESEARCH_DURATION_CONTROLLER_MODE=enabled`.
 `off` restores the internal 2/3 ranked/focused policy; `shadow` calculates and

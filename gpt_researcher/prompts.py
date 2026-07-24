@@ -299,11 +299,13 @@ The response should contain ONLY the list.
     def select_search_sources_prompt(question: str, cards: List[Dict[str, Any]], max_sources: int):
         """Build a compact, bounded source-selection instruction."""
         rendered_cards = "\n".join(
-            "[{id}] {title} | {url} | {snippet} | engine: {engine} | date: {date}".format(
+            "[{id}] {title} | {url} | {snippet} | role: {role} | "
+            "engine: {engine} | date: {date}".format(
                 id=card.get("id"),
                 title=card.get("title") or "(untitled)",
                 url=card.get("url") or "",
                 snippet=card.get("snippet") or "",
+                role=card.get("evidence_role") or "unknown",
                 engine=card.get("engine") or "",
                 date=card.get("date") or "",
             )
@@ -312,10 +314,11 @@ The response should contain ONLY the list.
         return f"""Select at most {max_sources} web pages to scrape for this research query:
 "{question}"
 
-Choose direct relevance first. Prefer official/primary documentation, papers, and
-first-party sources, while retaining credible independent technical coverage only
-when it adds material evidence. Favor query-anchor coverage, appropriate freshness
-when the question is time-sensitive, and domain diversity. Reject dictionary,
+Choose direct relevance first. Prefer first-party sources, original evidence, and
+accountable secondary coverage, while retaining clearly labeled practitioner
+evidence when it adds material evidence. A hosting platform alone does not make a
+source first-party. Favor query-anchor coverage, appropriate freshness when the
+question is time-sensitive, and domain diversity. Reject dictionary,
 text-comparison, generic utility, duplicate-domain, and off-topic pages unless a
 page is unusually direct and necessary. Do not invent facts from titles/snippets.
 

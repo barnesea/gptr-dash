@@ -29,6 +29,13 @@ DEFAULT_CONFIG: BaseConfig = {
     # it reaches the evidence context.  Opt-in preserves package behavior.
     "POST_SCRAPE_SOURCE_INTEGRITY": False,
     "SOURCE_CURATION_POLICY": "balanced",
+    # v2 preserves preliminary evidence across the job, renders compact
+    # entity-first queries, and judges every selected source before synthesis.
+    # "legacy" is an immediate rollback path.
+    "RETRIEVAL_PIPELINE_MODE": "legacy",
+    "SOURCE_EVIDENCE_JUDGE_MODE": "all",
+    "SOURCE_EVIDENCE_JUDGE_FALLBACK": "hybrid",
+    "CANONICAL_CONTENT_RESOLUTION": True,
     "MEMORY_BACKEND": "local",
     "TOTAL_WORDS": 1200,
     "REPORT_FORMAT": "APA",

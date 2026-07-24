@@ -16,10 +16,19 @@ from ..actions.source_selection import (
     extract_query_urls,
     has_meaningful_query_anchor,
     has_requested_evidence_relation,
+    requires_supported_evidence_relation,
     scope_anchor_matches_text,
-    source_domain,
     source_quality_tier,
+    source_site,
     source_url,
+)
+from ..actions.retrieval_pipeline import (
+    EvidenceCandidateLedger,
+    RETRIEVAL_PIPELINE_VERSION,
+    evidence_role,
+    missing_evidence_roles,
+    normalize_aspect_contract,
+    render_compact_query,
 )
 from ..utils.logging_config import get_json_handler
 
@@ -297,8 +306,7 @@ def parse_aspect_plan_response(
             priority = max(1, int(item.get("priority") or index + 1))
         except (TypeError, ValueError):
             priority = index + 1
-        aspects.append(
-            {
+        aspect_contract = {
                 "id": str(item.get("id") or f"aspect-{index + 1}"),
                 "priority": priority,
                 "question": question,
@@ -313,7 +321,13 @@ def parse_aspect_plan_response(
                 "required_scope_anchors": [
                     value for value in validated_scope_anchors
                 ],
+                "intent": str(item.get("intent") or "").strip().lower(),
+                "entities": item.get("entities") or entities,
+                "relation": str(item.get("relation") or "").strip(),
+                "evidence_roles": item.get("evidence_roles") or [],
             }
+        aspects.append(
+            normalize_aspect_contract(aspect_contract, original_query)
         )
         if len(aspects) >= num_aspects:
             break
@@ -496,6 +510,15 @@ class DeepResearchSkill:
         self._parallel_worker_seconds = 0.0
         self._executed_work_units = 0
         self._json_handler = get_json_handler()
+        self.retrieval_pipeline_mode = str(
+            getattr(researcher.cfg, "retrieval_pipeline_mode", "legacy")
+        ).strip().lower()
+        self.candidate_ledger = (
+            getattr(researcher, "candidate_ledger", None)
+            or EvidenceCandidateLedger()
+        )
+        self.researcher.candidate_ledger = self.candidate_ledger
+        self.preliminary_candidates: list[dict[str, Any]] = []
 
     def _emit_event(
         self,
@@ -744,7 +767,8 @@ Return ONLY a JSON object using this exact schema:
                 else f"{subject_query} {query_suffix}"
             )
             plan.append(
-                {
+                normalize_aspect_contract(
+                    {
                     "id": f"aspect-{index + 1}",
                     "priority": index + 1,
                     "question": (
@@ -757,7 +781,9 @@ Return ONLY a JSON object using this exact schema:
                     "expected_evidence_type": expected,
                     "original_query_anchors": sorted(_aspect_tokens(query))[:8],
                     "required_scope_anchors": [],
-                }
+                    },
+                    query,
+                )
             )
         return plan
 
@@ -766,7 +792,7 @@ Return ONLY a JSON object using this exact schema:
     ) -> List[Dict[str, Any]]:
         """Use preliminary result cards to construct a validated coverage plan."""
         started_at = time.perf_counter()
-        if num_aspects <= 1:
+        if num_aspects <= 1 and self.retrieval_pipeline_mode != "v2":
             plan = self._fallback_aspect_plan(query, 1)
             self._emit_event(
                 "aspect_plan",
@@ -826,9 +852,41 @@ Return ONLY a JSON object using this exact schema:
         initial_results = [
             result
             for result in preliminary_candidates
-            if source_quality_tier(result, subject_query) != "reject"
+            if (
+                (
+                    evidence_role(result, query=subject_query)
+                    if self.retrieval_pipeline_mode == "v2"
+                    else source_quality_tier(
+                        result, subject_query
+                    )
+                )
+                != "reject"
+            )
             and has_meaningful_query_anchor(subject_query, result)
         ][:max_results]
+        self.preliminary_candidates = list(initial_results)
+        if self.retrieval_pipeline_mode == "v2":
+            self.candidate_ledger.register(
+                initial_results,
+                stage="preliminary",
+                query=subject_query,
+            )
+        if num_aspects <= 1:
+            plan = self._fallback_aspect_plan(query, 1)
+            self._emit_event(
+                "aspect_plan",
+                {
+                    "planner_mode": "original_query_with_evidence",
+                    "pipeline_version": RETRIEVAL_PIPELINE_VERSION,
+                    "duration_seconds": round(
+                        time.perf_counter() - started_at, 3
+                    ),
+                    "aspects": plan,
+                    "initial_results": initial_results,
+                    "initial_result_count": len(initial_results),
+                },
+            )
+            return plan
         current_datetime = datetime.now()
         current_time = current_datetime.strftime("%Y-%m-%d")
         recency_window = _requested_recency_window(query, current_datetime)
@@ -841,10 +899,15 @@ Preliminary result cards:
 {initial_results}
 
 Return exactly {num_aspects} distinct aspects as JSON:
-{{"aspects":[{{"id":"aspect-1","priority":1,"question":"standalone question","search_query":"standalone natural-language search query","entities_versions_dates":["concrete item"],"expected_evidence_type":"one or two specific evidence types needed for this aspect","original_query_anchors":["literal anchor"],"required_scope_anchors":["each taxon, product, version, or region this aspect claims to cover"]}}]}}
+{{"aspects":[{{"id":"aspect-1","priority":1,"intent":"broad|entity|procedural|comparison|recent|mixed","question":"standalone question","search_query":"short entity-first natural-language query","entities":[{{"name":"literal entity/version/identifier","aliases":["evidence-supported alias"],"exact":true}}],"relation":"the requested relationship or task","evidence_roles":["first_party|original|reputable_secondary|practitioner"],"expected_evidence_type":"one or two specific evidence types needed for this aspect","original_query_anchors":["literal anchor"],"required_scope_anchors":["each taxon, product, version, or region this aspect claims to cover"]}}]}}
 
 Requirements:
 - Extract concrete entities, product versions, organizations, dates, and terminology from the result cards when supported.
+- Put exact named entities, versions, project identifiers, and only
+  evidence-supported aliases in entities. Do not put evidence descriptions or
+  anticipated answers there.
+- Make relation a short description of what must be established. Choose
+  evidence_roles by function, not hostname.
 - Each aspect must address a different required part of the original question.
 - Result cards are evidence hints, not new scope. Never create an aspect for a card topic unless the original query actually requires it.
 - When the original query names a broad category without a subtype, allocate
@@ -862,8 +925,8 @@ Requirements:
 - Do not put life stages, habitats, evidence types, or generic environments in
   required_scope_anchors. Describe those as evidence dimensions instead.
 - Scope anchors describe categories claimed by the aspect question. Never list
-  anticipated answers or preliminary-result examples (such as particular
-  predator species) as required scope anchors.
+  anticipated answers or examples visible only in preliminary results as
+  required scope anchors.
 - Do not use search operators, generic comparative wording, or invented details.
 - Prefer primary/official or scholarly evidence; use reputable independent technical coverage when it materially adds evidence.
 - Return JSON only."""
@@ -904,6 +967,11 @@ Requirements:
             "aspect_plan",
             {
                 "planner_mode": "evidence_grounded" if initial_results else "fallback",
+                "pipeline_version": (
+                    RETRIEVAL_PIPELINE_VERSION
+                    if self.retrieval_pipeline_mode == "v2"
+                    else "legacy"
+                ),
                 "duration_seconds": round(time.perf_counter() - started_at, 3),
                 "aspects": plan,
                 "initial_results": initial_results,
@@ -925,30 +993,82 @@ Requirements:
             for value in diagnostics.get("missing_scope_anchors", [])
             if str(value).strip()
         ]
+        previous_queries = {
+            " ".join(str(value).lower().split())
+            for value in diagnostics.get("attempted_queries", [])
+            if str(value).strip()
+        }
         if state == "scope_missing" and missing_scope:
-            missing_subject = " and ".join(missing_scope)
-            if re.search(
-                r"\b(?:predators?|predation|what eats|natural enemies)\b",
-                original_query,
-                re.IGNORECASE,
-            ):
-                candidate = (
-                    f"natural predators of {missing_subject} "
-                    "primary scholarly evidence"
-                )
-            else:
-                expected = _clean_planned_search_query(
-                    str(aspect.get("expected_evidence_type") or "primary evidence")
-                )
-                candidate = f"{missing_subject} {expected}".strip()
-            previous_queries = {
-                " ".join(str(value).lower().split())
-                for value in diagnostics.get("attempted_queries", [])
-                if str(value).strip()
+            scope_tokens = set().union(
+                *[
+                    _aspect_tokens(value)
+                    for value in [
+                        *missing_scope,
+                        *diagnostics.get("matched_scope_anchors", []),
+                        *(aspect.get("required_scope_anchors") or []),
+                    ]
+                    if str(value).strip()
+                ]
+            )
+            relation_source = str(
+                aspect.get("relation")
+                or original_query
+                or aspect.get("question")
+                or ""
+            )
+            scoped_relation = " ".join(
+                token
+                for token in ASPECT_TOKEN_PATTERN.findall(relation_source)
+                if token.lower() not in scope_tokens
+            )
+            scoped_aspect = {
+                **aspect,
+                "entities": [
+                    {"name": value, "aliases": [], "exact": True}
+                    for value in missing_scope
+                ],
+                "relation": scoped_relation,
             }
-            if " ".join(candidate.lower().split()) in previous_queries:
-                candidate = f"{candidate} independent source"
-            return _clean_planned_search_query(candidate)
+            candidate = render_compact_query(
+                normalize_aspect_contract(scoped_aspect, original_query),
+                evidence_role=(
+                    (aspect.get("evidence_roles") or ["original"])[0]
+                ),
+            )
+            if " ".join(candidate.lower().split()) not in previous_queries:
+                return candidate
+
+        if self.retrieval_pipeline_mode == "v2":
+            role_by_state = {
+                "no_candidates": "first_party",
+                "no_qualified_source": "first_party",
+                "scrape_failure": "first_party",
+                "integrity_failure": "first_party",
+                "compression_empty": "reputable_secondary",
+                "corroboration_missing": "practitioner",
+            }
+            target_role = role_by_state.get(state)
+            if (
+                state == "no_qualified_source"
+                and int(
+                    diagnostics.get(
+                        "evidence_judge_rejected_count"
+                    )
+                    or 0
+                )
+                and "practitioner"
+                in (aspect.get("evidence_roles") or [])
+            ):
+                target_role = "practitioner"
+            deterministic = render_compact_query(
+                aspect,
+                evidence_role=target_role,
+            )
+            if diagnostics.get("lexical_collision"):
+                deterministic = render_compact_query(aspect)
+            normalized = " ".join(deterministic.lower().split())
+            if deterministic and normalized not in previous_queries:
+                return deterministic
 
         prompt = f"""Repair one failed web-research query.
 
@@ -992,21 +1112,26 @@ do not invent details."""
             logger.warning("Repair query generation failed: %s", error)
 
         candidate = _clean_planned_search_query(candidate)
-        previous_queries = {
-            " ".join(str(value).lower().split())
-            for value in diagnostics.get("attempted_queries", [])
-            if str(value).strip()
-        }
         if not _queries_are_anchored(
             candidate, str(aspect.get("question") or ""), original_query
         ) or " ".join(candidate.lower().split()) in previous_queries:
             suffix = {
                 "no_candidates": "official documentation primary source",
-                "no_qualified_source": "official documentation technical paper",
-                "scrape_failure": "canonical PDF raw API documentation",
-                "integrity_failure": "foundational technical survey methodology",
-                "compression_empty": "technical details implementation evidence",
-                "corroboration_missing": "independent technical analysis evidence",
+                "no_qualified_source": (
+                    "official documentation technical paper"
+                ),
+                "scrape_failure": (
+                    "canonical PDF raw API documentation"
+                ),
+                "integrity_failure": (
+                    "foundational technical survey methodology"
+                ),
+                "compression_empty": (
+                    "technical details implementation evidence"
+                ),
+                "corroboration_missing": (
+                    "independent technical analysis evidence"
+                ),
                 "scope_missing": (
                     " ".join(diagnostics.get("missing_scope_anchors") or [])
                     + " primary evidence"
@@ -1016,6 +1141,8 @@ do not invent details."""
                 str(aspect.get("search_query") or original_query)
             )
             candidate = f"{base_query} {suffix}".strip()
+        if " ".join(candidate.lower().split()) in previous_queries:
+            candidate = f"{candidate} independent source".strip()
         return candidate
 
     @staticmethod
@@ -1312,6 +1439,12 @@ enough."""
         node_id = "root.seed"
         started_at = time.perf_counter()
         self._executed_work_units += 1
+        if self.retrieval_pipeline_mode == "v2":
+            self.candidate_ledger.register(
+                [{"url": url, "title": "", "snippet": ""} for url in urls],
+                stage="direct_url",
+                query=self.researcher.query,
+            )
         self._emit_event(
             "direct_url_seed",
             {"state": "started", "urls": urls},
@@ -1336,6 +1469,7 @@ enough."""
             ),
             research_mode="deep_branch",
             research_policy=self.research_policy,
+            candidate_ledger=self.candidate_ledger,
             trajectory=getattr(self.researcher, "trajectory", None),
             trajectory_node_id=node_id,
             trajectory_parent_node_id="root",
@@ -1412,7 +1546,7 @@ enough."""
             tier = source_quality_tier(source, classification_query)
             tiers[tier] = tiers.get(tier, 0) + 1
             if tier == "fallback":
-                domain = source_domain(source_url(source))
+                domain = source_site(source_url(source))
                 if domain:
                     fallback_domains.add(domain)
         details = {
@@ -1435,6 +1569,13 @@ enough."""
         if int(diagnostics.get("accepted_count") or 0) == 0:
             if int(diagnostics.get("integrity_rejected_count") or 0):
                 return "integrity_failure", details
+            if int(
+                diagnostics.get("evidence_judge_rejected_count") or 0
+            ):
+                details["judgment_rejected_count"] = int(
+                    diagnostics.get("evidence_judge_rejected_count") or 0
+                )
+                return "no_qualified_source", details
             return "scrape_failure", details
         if not str(context or "").strip():
             return "compression_empty", details
@@ -1443,15 +1584,70 @@ enough."""
         if tiers["primary"] + tiers["reputable"] + tiers["fallback"] == 0:
             return "no_qualified_source", details
         evidence_text = str(context or "").lower()
-        if not has_requested_evidence_relation(
-            classification_query,
-            evidence_text,
-            required_scope_anchors=details["required_scope_anchors"],
+        judge_results = [
+            source.get("_gptr_evidence_judgment")
+            for source in sources
+            if isinstance(source.get("_gptr_evidence_judgment"), dict)
+        ]
+        judge_verified_relation = bool(judge_results) and all(
+            result.get("supports_aspect") and not result.get("fallback")
+            for result in judge_results
+        )
+        deterministic_relation_required = (
+            self.retrieval_pipeline_mode == "v2"
+            and requires_supported_evidence_relation(classification_query)
+        ) or bool(
+            details["required_scope_anchors"]
+            and classification_query.strip()
+        )
+        if (
+            not judge_verified_relation
+            and deterministic_relation_required
+            and not has_requested_evidence_relation(
+                classification_query,
+                evidence_text,
+                required_scope_anchors=details[
+                    "required_scope_anchors"
+                ],
+                relation=str((aspect or {}).get("relation") or ""),
+                entity_anchors=list(
+                    (aspect or {}).get("entities") or []
+                ),
+            )
         ):
             details["relationship_evidence_missing"] = True
             return "compression_empty", details
+        judged_scope = [
+            str(value)
+            for result in judge_results
+            for value in result.get("supported_scope", [])
+            if str(value).strip()
+        ]
         for scope_anchor in details["required_scope_anchors"]:
-            matched = scope_anchor_matches_text(scope_anchor, evidence_text)
+            anchor_tokens = _aspect_tokens(scope_anchor)
+            lexical_aliases = [scope_anchor]
+            for entity in (aspect or {}).get("entities") or []:
+                if not isinstance(entity, dict):
+                    continue
+                entity_name = str(entity.get("name") or "")
+                if anchor_tokens & _aspect_tokens(entity_name):
+                    lexical_aliases.extend(
+                        str(value)
+                        for value in entity.get("aliases") or []
+                        if str(value).strip()
+                    )
+            matched = any(
+                scope_anchor_matches_text(alias, evidence_text)
+                for alias in lexical_aliases
+            ) or any(
+                bool(
+                    set().union(
+                        *(_aspect_tokens(alias) for alias in lexical_aliases)
+                    )
+                    & _aspect_tokens(value)
+                )
+                for value in judged_scope
+            )
             target = (
                 details["matched_scope_anchors"]
                 if matched
@@ -1482,7 +1678,20 @@ enough."""
             details["required_fallback_domains"] = required
             if len(fallback_domains) < required:
                 return "corroboration_missing", details
-            details["corroborated"] = True
+            if self.retrieval_pipeline_mode != "v2":
+                details["corroborated"] = True
+            elif judge_results and all(
+                result.get("accepted_for_synthesis")
+                and result.get("corroborated_by")
+                and not result.get("fallback")
+                for result in judge_results
+            ):
+                details["corroborated"] = True
+                details["corroboration_mode"] = (
+                    "source_evidence_judge"
+                )
+            else:
+                details["corroboration_pending"] = True
         return "evidence_ready", details
 
     def _combine_repair_evidence(
@@ -1610,6 +1819,9 @@ enough."""
             "question": aspect.get("question"),
             "search_query": result.get("query") or aspect.get("search_query"),
             "expected_evidence_type": aspect.get("expected_evidence_type"),
+            "required_evidence_roles": list(
+                aspect.get("evidence_roles") or []
+            ),
             "required_scope_anchors": result.get(
                 "required_scope_anchors",
                 aspect.get("required_scope_anchors") or [],
@@ -1630,6 +1842,26 @@ enough."""
             "corroboration_mode": result.get("corroboration_mode", ""),
             "verified_urls": [
                 source_url(source)
+                for source in result.get("sources") or []
+                if source_url(source)
+            ],
+            "verified_sources": [
+                {
+                    "url": source_url(source),
+                    "evidence_role": source.get(
+                        "_gptr_evidence_role", ""
+                    ),
+                    "source_tier": source_quality_tier(source),
+                    "supported_entities": (
+                        source.get("_gptr_evidence_judgment") or {}
+                    ).get("supported_entities", []),
+                    "supported_scope": (
+                        source.get("_gptr_evidence_judgment") or {}
+                    ).get("supported_scope", []),
+                    "supported_claims": (
+                        source.get("_gptr_evidence_judgment") or {}
+                    ).get("supported_claims", []),
+                }
                 for source in result.get("sources") or []
                 if source_url(source)
             ],
@@ -1764,6 +1996,14 @@ enough."""
                             or "Research a narrow evidence-backed aspect of the parent question."
                         ),
                         "research_policy": self.research_policy,
+                        "candidate_ledger": self.candidate_ledger,
+                        "seed_candidates": serp_query.get(
+                            "seed_candidates", []
+                        ),
+                        "research_aspect": serp_query.get("aspect") or {},
+                        "excluded_candidate_urls": serp_query.get(
+                            "excluded_candidate_urls", []
+                        ),
                     }
                     researcher = GPTResearcher(
                         query=serp_query['query'],
@@ -1816,6 +2056,7 @@ enough."""
                     )
                     fallback_only = (
                         coverage_state == "evidence_ready"
+                        and not coverage_details.get("corroborated")
                         and coverage_details["source_tiers"]["fallback"] > 0
                         and coverage_details["source_tiers"]["primary"]
                         + coverage_details["source_tiers"]["reputable"]
@@ -2076,6 +2317,14 @@ enough."""
                                 f"{repair_counts[aspect_id]}"
                             ),
                             "repair_reason": result.get("coverage_state"),
+                            "excluded_candidate_urls": [
+                                source_url(source)
+                                for source in result.get(
+                                    "attempted_sources"
+                                )
+                                or []
+                                if source_url(source)
+                            ],
                         }
                     )
                 repaired = await asyncio.gather(
@@ -2461,14 +2710,70 @@ enough."""
                 "aspect_count": len(aspect_plan),
             },
         )
-        root_queries = [
-            {
-                "query": self._query_with_evidence_standard(aspect),
-                "researchGoal": aspect["question"],
-                "aspect": aspect,
-            }
-            for aspect in aspect_plan
-        ]
+        root_queries = []
+        for aspect in aspect_plan:
+            if self.retrieval_pipeline_mode == "v2":
+                seed_candidates = self.candidate_ledger.candidates_for_aspect(
+                    aspect,
+                    limit=(
+                        self.research_policy.scrape_cap_per_query
+                        if self.research_policy
+                        else 3
+                    ),
+                )
+                missing_roles = missing_evidence_roles(
+                    aspect, seed_candidates
+                )
+                target_role = (
+                    missing_roles[0]
+                    if missing_roles
+                    and missing_roles[0] != "relevant"
+                    else (aspect.get("evidence_roles") or [None])[0]
+                )
+                query = render_compact_query(
+                    aspect,
+                    evidence_role=target_role,
+                )
+            else:
+                seed_candidates = []
+                missing_roles = []
+                target_role = None
+                query = self._query_with_evidence_standard(aspect)
+            root_queries.append(
+                {
+                    "query": query,
+                    "researchGoal": aspect["question"],
+                    "aspect": aspect,
+                    "seed_candidates": seed_candidates,
+                    "missing_evidence_roles": missing_roles,
+                    "target_evidence_role": target_role,
+                }
+            )
+        if self.retrieval_pipeline_mode == "v2":
+            self._emit_event(
+                "candidate_assignment",
+                {
+                    "pipeline_version": RETRIEVAL_PIPELINE_VERSION,
+                    "aspects": [
+                        {
+                            "aspect_id": item["aspect"]["id"],
+                            "query": item["query"],
+                            "seed_count": len(item["seed_candidates"]),
+                            "seed_urls": [
+                                source_url(candidate)
+                                for candidate in item["seed_candidates"]
+                            ],
+                            "missing_evidence_roles": item[
+                                "missing_evidence_roles"
+                            ],
+                            "target_evidence_role": item[
+                                "target_evidence_role"
+                            ],
+                        }
+                        for item in root_queries
+                    ],
+                },
+            )
 
         initial_retrieval_started_at = time.perf_counter()
         direct_has_evidence = bool(
@@ -2611,12 +2916,14 @@ enough."""
                         "question",
                         "state",
                         "expected_evidence_type",
+                        "required_evidence_roles",
                         "source_tiers",
                         "required_scope_anchors",
                         "matched_scope_anchors",
                         "missing_scope_anchors",
                         "corroborated",
                         "verified_urls",
+                        "verified_sources",
                     )
                 }
                 for item in self.coverage_ledger
@@ -2628,10 +2935,9 @@ enough."""
                 + "\nUse factual material only from evidence_ready aspects. "
                 "Explicitly state unresolved gaps; never resolve them from model "
                 "knowledge. Do not call fallback sources primary, generalize "
-                "beyond matched scope anchors, or classify diseases, parasites, "
-                "microbes, or environmental hazards as predators. Describe "
-                "defenses as reducing vulnerability or predation risk; never "
-                "call an animal immune to predators."
+                "beyond matched scope anchors, merge distinct evidence roles, "
+                "or reclassify adjacent causes, effects, risks, mitigations, or "
+                "correlations as the relationship asked by the user."
             )
 
         # Trim final context to word limit
@@ -2662,6 +2968,10 @@ enough."""
             "context_chars": len(self.researcher.context),
             "max_active_branches": self._max_active_branches,
         })
+        if self.retrieval_pipeline_mode == "v2":
+            candidate_snapshot = self.candidate_ledger.snapshot()
+            self.researcher.candidate_ledger_snapshot = candidate_snapshot
+            self._emit_event("candidate_ledger", candidate_snapshot)
 
         # Return the context - don't generate report here as it will be done by the main agent
         return self.researcher.context

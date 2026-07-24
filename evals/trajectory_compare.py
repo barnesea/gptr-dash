@@ -41,6 +41,17 @@ def summarize(path: Path) -> dict[str, Any]:
     compression_rescues = 0
     stage_timings: Counter[str] = Counter()
     critical_path: dict[str, Any] = {}
+    candidate_ledger: dict[str, Any] = {}
+    adaptive_search_decisions = 0
+    reused_without_search = 0
+    lexical_collisions = 0
+    resolver_attempts = 0
+    resolver_recoveries = 0
+    judgment_batches = 0
+    judged_sources = 0
+    judgment_accepted = 0
+    judgment_rejected = 0
+    judgment_fallbacks = 0
 
     for event in events:
         event_type = event.get("type")
@@ -96,6 +107,22 @@ def summarize(path: Path) -> dict[str, Any]:
             )
         elif event_type == "critical_path_timing":
             critical_path = data
+        elif event_type == "candidate_ledger":
+            candidate_ledger = data
+        elif event_type == "adaptive_search_decision":
+            adaptive_search_decisions += 1
+            reused_without_search += not bool(data.get("search_needed", True))
+        elif event_type == "search_results":
+            lexical_collisions += bool(data.get("lexical_collision"))
+        elif event_type == "canonical_source_recovery":
+            resolver_attempts += len(data.get("attempted_urls") or [])
+            resolver_recoveries += len(data.get("recovered") or [])
+        elif event_type == "source_evidence_judgment":
+            judgment_batches += 1
+            judged_sources += int(data.get("source_count") or 0)
+            judgment_accepted += int(data.get("accepted_count") or 0)
+            judgment_rejected += int(data.get("rejected_count") or 0)
+            judgment_fallbacks += bool(data.get("fallback_used"))
         elif event_type == "job_completed":
             final = data
 
@@ -138,6 +165,22 @@ def summarize(path: Path) -> dict[str, Any]:
         "sub_query_count": counts["sub_query"],
         "unique_query_count": len(queries),
         "search_passes": counts["search_results"],
+        "candidate_count": int(
+            candidate_ledger.get("candidate_count") or 0
+        ),
+        "preliminary_reuse_rate": round(
+            reused_without_search / adaptive_search_decisions, 4
+        ) if adaptive_search_decisions else 0.0,
+        "lexical_collision_count": lexical_collisions,
+        "resolver_attempt_count": resolver_attempts,
+        "resolver_recovery_count": resolver_recoveries,
+        "evidence_judgment_batches": judgment_batches,
+        "evidence_judged_source_count": judged_sources,
+        "evidence_judgment_acceptance_rate": round(
+            judgment_accepted / judged_sources, 4
+        ) if judged_sources else 0.0,
+        "evidence_judgment_rejected_count": judgment_rejected,
+        "evidence_judge_fallback_count": judgment_fallbacks,
         "selector_calls": sum(
             (event.get("data") or {}).get("selector_mode") == "llm"
             for event in events
