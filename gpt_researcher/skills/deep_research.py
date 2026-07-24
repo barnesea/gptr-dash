@@ -16,6 +16,7 @@ from ..actions.source_selection import (
     extract_query_urls,
     has_meaningful_query_anchor,
     has_requested_evidence_relation,
+    scope_anchor_matches_text,
     source_domain,
     source_quality_tier,
     source_url,
@@ -904,6 +905,36 @@ Requirements:
     ) -> str:
         """Rewrite a failed aspect using the concrete retrieval failure signal."""
         original_query = self.original_query
+        missing_scope = [
+            str(value).strip()
+            for value in diagnostics.get("missing_scope_anchors", [])
+            if str(value).strip()
+        ]
+        if state == "scope_missing" and missing_scope:
+            missing_subject = " and ".join(missing_scope)
+            if re.search(
+                r"\b(?:predators?|predation|what eats|natural enemies)\b",
+                original_query,
+                re.IGNORECASE,
+            ):
+                candidate = (
+                    f"natural predators of {missing_subject} "
+                    "primary scholarly evidence"
+                )
+            else:
+                expected = _clean_planned_search_query(
+                    str(aspect.get("expected_evidence_type") or "primary evidence")
+                )
+                candidate = f"{missing_subject} {expected}".strip()
+            previous_queries = {
+                " ".join(str(value).lower().split())
+                for value in diagnostics.get("attempted_queries", [])
+                if str(value).strip()
+            }
+            if " ".join(candidate.lower().split()) in previous_queries:
+                candidate = f"{candidate} independent source"
+            return _clean_planned_search_query(candidate)
+
         prompt = f"""Repair one failed web-research query.
 
 Original user question: {original_query}
@@ -1404,15 +1435,8 @@ enough."""
         ):
             details["relationship_evidence_missing"] = True
             return "compression_empty", details
-        evidence_tokens = _aspect_tokens(evidence_text)
         for scope_anchor in details["required_scope_anchors"]:
-            normalized_anchor = " ".join(
-                str(scope_anchor).lower().split()
-            ).strip()
-            anchor_tokens = _aspect_tokens(normalized_anchor)
-            matched = bool(normalized_anchor and normalized_anchor in evidence_text)
-            if not matched and anchor_tokens:
-                matched = anchor_tokens.issubset(evidence_tokens)
+            matched = scope_anchor_matches_text(scope_anchor, evidence_text)
             target = (
                 details["matched_scope_anchors"]
                 if matched
@@ -1509,6 +1533,51 @@ enough."""
             replacement["sources"] = []
         return replacement
 
+    def _partial_scope_result(
+        self,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        """Promote verified matched scope without resolving the remaining gap."""
+        if result.get("coverage_state") != "scope_missing":
+            return None
+        matched_scope = list(result.get("matched_scope_anchors") or [])
+        missing_scope = list(result.get("missing_scope_anchors") or [])
+        attempted_context = str(result.get("attempted_context") or "")
+        attempted_sources = list(result.get("attempted_sources") or [])
+        if not matched_scope or not missing_scope:
+            return None
+
+        parent_aspect = dict(result.get("aspect") or {})
+        parent_id = str(parent_aspect.get("id") or "aspect")
+        partial_aspect = {
+            **parent_aspect,
+            "id": f"{parent_id}:verified-partial",
+            "question": (
+                "Verified partial coverage for "
+                + ", ".join(str(value) for value in matched_scope)
+            ),
+            "required_scope_anchors": matched_scope,
+        }
+        state, details = self._coverage_state(
+            attempted_context,
+            attempted_sources,
+            result.get("retrieval_diagnostics") or {},
+            aspect=partial_aspect,
+        )
+        if state != "evidence_ready":
+            return None
+        return {
+            **result,
+            "aspect": partial_aspect,
+            "context": attempted_context,
+            "sources": attempted_sources,
+            "coverage_state": state,
+            "partial_scope": True,
+            "parent_aspect_id": parent_id,
+            "recovery_reason": "verified partial scope preserved",
+            **details,
+        }
+
     @staticmethod
     def _coverage_ledger_entry(
         aspect: Dict[str, Any],
@@ -1520,6 +1589,8 @@ enough."""
         diagnostics = result.get("retrieval_diagnostics") or {}
         return {
             "aspect_id": aspect.get("id"),
+            "parent_aspect_id": result.get("parent_aspect_id"),
+            "partial_scope": bool(result.get("partial_scope")),
             "priority": aspect.get("priority"),
             "question": aspect.get("question"),
             "search_query": result.get("query") or aspect.get("search_query"),
@@ -1545,6 +1616,11 @@ enough."""
             "verified_urls": [
                 source_url(source)
                 for source in result.get("sources") or []
+                if source_url(source)
+            ],
+            "retrieved_urls": [
+                source_url(source)
+                for source in result.get("attempted_sources") or []
                 if source_url(source)
             ],
         }
@@ -2008,6 +2084,10 @@ enough."""
                     improved = (
                         replacement.get("coverage_state") == "evidence_ready"
                         or new_score > old_score
+                        or len(
+                            replacement.get("matched_scope_anchors") or []
+                        )
+                        > len(best_previous.get("matched_scope_anchors") or [])
                     )
                     self._emit_event(
                         "coverage_repair",
@@ -2040,7 +2120,32 @@ enough."""
                 ):
                     break
 
+        ledger_results = results
         if node_id == "root":
+            partial_scope_results = [
+                partial
+                for result in results
+                if (partial := self._partial_scope_result(result)) is not None
+            ]
+            ledger_results = [*results, *partial_scope_results]
+            for partial in partial_scope_results:
+                self._emit_event(
+                    "partial_scope_evidence",
+                    {
+                        "aspect_id": (partial.get("aspect") or {}).get("id"),
+                        "parent_aspect_id": partial.get("parent_aspect_id"),
+                        "matched_scope_anchors": partial.get(
+                            "matched_scope_anchors", []
+                        ),
+                        "source_urls": [
+                            source_url(source)
+                            for source in partial.get("sources") or []
+                            if source_url(source)
+                        ],
+                    },
+                    node_id=partial.get("node_id", node_id),
+                    parent_node_id=node_id,
+                )
             self.coverage_ledger = [
                 self._coverage_ledger_entry(
                     result.get("aspect") or {
@@ -2063,7 +2168,7 @@ enough."""
                         str((result.get("aspect") or {}).get("id")), 0
                     ),
                 )
-                for index, result in enumerate(results)
+                for index, result in enumerate(ledger_results)
             ]
             self.researcher.coverage_ledger = self.coverage_ledger
             self._emit_event(
@@ -2091,7 +2196,12 @@ enough."""
                 },
             )
 
-        local = self._merge_results(results, learnings, citations, visited_urls)
+        local = self._merge_results(
+            ledger_results,
+            learnings,
+            citations,
+            visited_urls,
+        )
         deeper_result_sets: List[Dict[str, Any]] = []
         deepening_allowed = (
             depth > 1

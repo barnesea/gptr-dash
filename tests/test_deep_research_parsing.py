@@ -140,6 +140,119 @@ def test_scope_terms_without_scoped_predation_claim_are_not_ready():
     assert details["relationship_evidence_missing"] is True
 
 
+def test_box_turtle_predation_satisfies_terrestrial_turtle_scope():
+    skill = make_skill()
+    skill.original_query = "What are the natural predators of turtles?"
+    diagnostics = {
+        "candidate_count": 1,
+        "selected_count": 1,
+        "scraped_count": 1,
+        "accepted_count": 1,
+    }
+    state, details = skill._coverage_state(
+        (
+            "Predators of ornate box turtle nests include raccoons and "
+            "striped skunks."
+        ),
+        [{"url": "https://pmc.ncbi.nlm.nih.gov/articles/example/"}],
+        diagnostics,
+        aspect={
+            "question": "What are predators of terrestrial turtles?",
+            "required_scope_anchors": ["terrestrial turtles", "turtle nests"],
+        },
+    )
+    assert state == "evidence_ready"
+    assert details["matched_scope_anchors"] == [
+        "terrestrial turtles",
+        "turtle nests",
+    ]
+
+
+def test_partial_scope_evidence_is_preserved_as_ready_child_coverage():
+    skill = make_skill()
+    skill.original_query = "What are the natural predators of turtles?"
+    source = {
+        "url": "https://pmc.ncbi.nlm.nih.gov/articles/example/",
+        "title": "Freshwater turtle nest predation",
+    }
+    result = {
+        "node_id": "root.2",
+        "query": "turtle predators",
+        "aspect": {
+            "id": "aspect-2",
+            "question": "Freshwater and terrestrial turtle predators",
+            "required_scope_anchors": [
+                "freshwater turtles",
+                "terrestrial turtles",
+            ],
+        },
+        "coverage_state": "scope_missing",
+        "matched_scope_anchors": ["freshwater turtles"],
+        "missing_scope_anchors": ["terrestrial turtles"],
+        "attempted_context": (
+            "Predators of freshwater turtle nests include foxes and raccoons."
+        ),
+        "attempted_sources": [source],
+        "retrieval_diagnostics": {
+            "candidate_count": 1,
+            "selected_count": 1,
+            "scraped_count": 1,
+            "accepted_count": 1,
+        },
+    }
+
+    partial = skill._partial_scope_result(result)
+
+    assert partial is not None
+    assert partial["coverage_state"] == "evidence_ready"
+    assert partial["partial_scope"] is True
+    assert partial["parent_aspect_id"] == "aspect-2"
+    assert partial["sources"] == [source]
+    assert partial["aspect"]["required_scope_anchors"] == [
+        "freshwater turtles"
+    ]
+    ledger = skill._coverage_ledger_entry(
+        partial["aspect"],
+        partial,
+    )
+    assert ledger["verified_urls"] == [source["url"]]
+    assert ledger["retrieved_urls"] == [source["url"]]
+    assert ledger["partial_scope"] is True
+
+
+@pytest.mark.asyncio
+async def test_scope_repair_targets_only_missing_anchor(monkeypatch):
+    skill = make_skill()
+    skill.original_query = "What are the natural predators of turtles?"
+
+    async def unexpected_completion(**_kwargs):
+        raise AssertionError("scope repair should be deterministic")
+
+    monkeypatch.setattr(
+        deep_research_module,
+        "create_chat_completion",
+        unexpected_completion,
+    )
+    query = await skill.generate_repair_query(
+        {
+            "question": "Freshwater and terrestrial turtle predators",
+            "search_query": "freshwater terrestrial turtle predators",
+            "expected_evidence_type": "primary scholarly evidence",
+        },
+        "scope_missing",
+        {
+            "matched_scope_anchors": ["freshwater turtles"],
+            "missing_scope_anchors": ["terrestrial turtles"],
+            "attempted_queries": ["freshwater terrestrial turtle predators"],
+        },
+    )
+
+    assert query == (
+        "natural predators of terrestrial turtles primary scholarly evidence"
+    )
+    assert "freshwater" not in query
+
+
 def test_repair_combines_partial_scope_instead_of_discarding_it():
     skill = make_skill()
     aspect = {

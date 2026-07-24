@@ -364,31 +364,57 @@ def has_requested_evidence_relation(
     if not required_scope_anchors:
         return True
 
-    def scope_patterns(anchor: str) -> tuple[str, ...]:
-        normalized = " ".join(anchor.lower().split())
-        if "terrestrial turtle" in normalized:
-            return (
-                r"\bterrestrial turtles?\b",
-                r"\bland turtles?\b",
-                r"\btortoises?\b",
-                r"\bbox turtles?\b",
-            )
-        if "freshwater turtle" in normalized:
-            return (
-                r"\bfreshwater turtles?\b",
-                r"\bpond turtles?\b",
-                r"\briver turtles?\b",
-            )
-        if "sea turtle" in normalized:
-            return (r"\bsea turtles?\b", r"\bmarine turtles?\b")
-        return (rf"\b{re.escape(normalized)}\b",)
-
     return all(
         any(
-            any(re.search(pattern, claim, re.IGNORECASE) for pattern in scope_patterns(anchor))
+            scope_anchor_matches_text(anchor, claim)
             for claim in claims
         )
         for anchor in required_scope_anchors
+    )
+
+
+def scope_anchor_patterns(anchor: str) -> tuple[str, ...]:
+    """Return conservative lexical aliases for one scope category."""
+    normalized = " ".join(str(anchor).lower().split())
+    if "adult sea turtle" in normalized:
+        return (
+            r"\badult sea turtles?\b",
+            r"\badult marine turtles?\b",
+        )
+    if "juvenile sea turtle" in normalized:
+        return (
+            r"\bjuvenile sea turtles?\b",
+            r"\bjuvenile marine turtles?\b",
+            r"\bsea turtle (?:juveniles?|hatchlings?)\b",
+        )
+    if "terrestrial turtle" in normalized:
+        return (
+            r"\bterrestrial turtles?\b",
+            r"\bland turtles?\b",
+            r"\btortoises?\b",
+            r"\bbox turtles?\b",
+        )
+    if "freshwater turtle" in normalized:
+        return (
+            r"\bfreshwater turtles?\b",
+            r"\bpond turtles?\b",
+            r"\briver turtles?\b",
+        )
+    if "sea turtle" in normalized:
+        return (r"\bsea turtles?\b", r"\bmarine turtles?\b")
+    if "turtle nest" in normalized:
+        return (
+            r"\bturtle nests?\b",
+            r"\bturtle (?:eggs?|clutches?)\b",
+        )
+    return (rf"\b{re.escape(normalized)}\b",)
+
+
+def scope_anchor_matches_text(anchor: str, text: str) -> bool:
+    """Match a scope anchor using the same aliases as relation validation."""
+    return any(
+        re.search(pattern, text or "", re.IGNORECASE)
+        for pattern in scope_anchor_patterns(anchor)
     )
 
 

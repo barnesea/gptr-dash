@@ -594,9 +594,11 @@ async def deep_research(
         
     Returns:
         Dict containing a cited, final GPT Researcher report and its sources.  On
-        success, return the report directly to the user. Do not run extra quick
-        searches or call write_report afterwards: this tool already completes
-        both research and report writing in one bounded operation.
+        success, the caller MUST output the ``report`` field verbatim. Do not
+        summarize, reinterpret, expand, or supplement it with model knowledge.
+        Preserve every evidence limitation. Do not run extra quick searches or
+        call write_report afterwards: this tool already completes both research
+        and report writing in one bounded operation.
     """
     duration, budget_error = validate_research_duration_input(
         research_duration_seconds
@@ -708,7 +710,23 @@ async def _run_deep_research(
         # Store in the research store for the resource API
         store_research_results(query, context, sources, source_urls)
 
+        retrieved_source_urls = sorted(
+            {
+                str(url)
+                for item in researcher.coverage_ledger
+                for url in item.get("retrieved_urls", [])
+                if str(url).strip()
+            }
+        )
+        excluded_source_urls = [
+            url for url in retrieved_source_urls if url not in source_urls
+        ]
         response: Dict[str, Any] = {
+            "answer_ready": False,
+            "presentation_instruction": (
+                "Wait for answer_ready=true, then output only the report field "
+                "verbatim. Never add facts from model knowledge."
+            ),
             "query": query,
             "report_type": report_type,
             "recursive_deep_research_enabled": recursive_deep_research_enabled(),
@@ -727,6 +745,10 @@ async def _run_deep_research(
             "source_count": len(sources),
             "sources": format_sources_for_response(sources),
             "source_urls": source_urls,
+            "retrieved_source_count": len(retrieved_source_urls),
+            "retrieved_source_urls": retrieved_source_urls,
+            "excluded_source_count": len(excluded_source_urls),
+            "excluded_source_urls": excluded_source_urls,
             "coverage_ledger": researcher.coverage_ledger,
             "executed_work_units": (
                 researcher.deep_researcher._executed_work_units
@@ -773,8 +795,10 @@ async def _run_deep_research(
             )
             response["answer_ready"] = True
             response["presentation_instruction"] = (
-                "Present the report directly. Do not factually reinterpret, "
-                "expand, or re-synthesize it."
+                "MANDATORY: output only the report field verbatim, with no "
+                "preface, summary, reinterpretation, expansion, or additional "
+                "facts. Preserve all evidence limitations. Do not use model "
+                "knowledge to fill gaps."
             )
         else:
             response["context"] = context
