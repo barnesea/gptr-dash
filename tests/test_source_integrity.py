@@ -66,6 +66,28 @@ def test_post_scrape_integrity_rejects_redirected_off_topic_page():
     assert reason == "post-scrape reject: fetched page has no meaningful query-anchor coverage"
 
 
+def test_post_scrape_integrity_requires_requested_predation_evidence():
+    candidate = _card(
+        "https://www.fisheries.noaa.gov/species/hawksbill-turtle",
+        "Hawksbill Turtle",
+        "Sea turtle life stages and habitat.",
+    )
+    scraped = {
+        "url": candidate["href"],
+        "title": "Hawksbill Turtle",
+        "raw_content": (
+            "Hawksbill sea turtles use coral reef habitats throughout "
+            "different life stages. NOAA Fisheries manages conservation."
+        ),
+    }
+    reason = post_scrape_integrity_reason(
+        "natural predators of sea turtles by life stage",
+        candidate,
+        scraped,
+    )
+    assert "requested predation relationship" in reason
+
+
 def test_hugging_face_title_normalization_accepts_concatenated_extracted_title():
     query = "Do deep research on https://huggingface.co/microsoft/Mage-Flow"
     candidate = _card(

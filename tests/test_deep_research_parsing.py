@@ -115,6 +115,50 @@ def test_partial_taxon_evidence_is_scope_missing():
     ]
 
 
+def test_repair_combines_partial_scope_instead_of_discarding_it():
+    skill = make_skill()
+    aspect = {
+        "id": "taxa",
+        "required_scope_anchors": [
+            "freshwater turtles",
+            "terrestrial turtles",
+        ],
+    }
+    previous = {
+        "aspect": aspect,
+        "attempted_context": "Freshwater turtles face aquatic predators.",
+        "attempted_sources": [
+            {"url": "https://environment.nsw.gov.au/freshwater-turtles"}
+        ],
+        "retrieval_diagnostics": {
+            "candidate_count": 1,
+            "selected_count": 1,
+            "scraped_count": 1,
+            "accepted_count": 1,
+        },
+    }
+    replacement = {
+        "aspect": aspect,
+        "attempted_context": "Terrestrial turtles face land predators.",
+        "attempted_sources": [
+            {"url": "https://example.museum/terrestrial-turtles"}
+        ],
+        "retrieval_diagnostics": {
+            "candidate_count": 1,
+            "selected_count": 1,
+            "scraped_count": 1,
+            "accepted_count": 1,
+        },
+    }
+
+    combined = skill._combine_repair_evidence(previous, replacement)
+
+    assert combined["coverage_state"] == "evidence_ready"
+    assert len(combined["sources"]) == 2
+    assert "Freshwater turtles" in combined["context"]
+    assert "Terrestrial turtles" in combined["context"]
+
+
 def test_aspect_query_encodes_expected_primary_evidence_standard():
     query = DeepResearchSkill._query_with_evidence_standard(
         {

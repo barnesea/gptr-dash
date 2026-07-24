@@ -93,18 +93,11 @@ def report_quality_diagnostics(
         for paragraph in re.split(r"\n\s*\n", body)
         if paragraph.strip()
         and not paragraph.lstrip().startswith(("#", "```", ">"))
+        and not paragraph.lstrip().startswith("|")
         and len(re.sub(r"\s+", " ", paragraph)) >= 80
-    ]
-    cited_paragraphs = [
-        paragraph for paragraph in paragraphs if INLINE_LINK_PATTERN.search(paragraph)
     ]
     has_verified_sources = any(
         item.get("verified_urls") for item in coverage_ledger
-    )
-    citation_rate = (
-        len(cited_paragraphs) / len(paragraphs)
-        if paragraphs and has_verified_sources
-        else 1.0
     )
     unresolved = [
         str(item.get("aspect_id") or item.get("question") or "unknown")
@@ -138,7 +131,23 @@ def report_quality_diagnostics(
         r"\b(?:gap|insufficient|missing|not researched|not established|"
         r"unresolved|unknown|could not verify|no verified evidence|"
         r"no verified urls?|not matched|unverified|precludes|cannot support|"
-        r"required scope anchors?|evidence limitation)\b"
+        r"required scope anchors?|incomplete|scope_missing|scrape_failure|"
+        r"compression_empty|evidence limitation)\b"
+    )
+    evidence_paragraphs = [
+        paragraph
+        for paragraph in paragraphs
+        if not limitation_terms.search(paragraph.lower())
+    ]
+    cited_paragraphs = [
+        paragraph
+        for paragraph in evidence_paragraphs
+        if INLINE_LINK_PATTERN.search(paragraph)
+    ]
+    citation_rate = (
+        len(cited_paragraphs) / len(evidence_paragraphs)
+        if evidence_paragraphs and has_verified_sources
+        else 1.0
     )
     unsupported_scope_claims: list[str] = []
     for item in coverage_ledger:
@@ -178,7 +187,7 @@ def report_quality_diagnostics(
         issues.append("citations appear only in the references section")
     if has_verified_sources and citation_rate < 0.9:
         issues.append(
-            f"only {len(cited_paragraphs)}/{len(paragraphs)} substantive paragraphs have inline citations"
+            f"only {len(cited_paragraphs)}/{len(evidence_paragraphs)} substantive evidence paragraphs have inline citations"
         )
     if unsupported_comprehensive:
         issues.append("report claims comprehensive coverage despite unresolved aspects")
@@ -195,7 +204,7 @@ def report_quality_diagnostics(
         "passes": not issues,
         "issues": issues,
         "body_citation_count": len(INLINE_LINK_PATTERN.findall(body)),
-        "substantive_paragraph_count": len(paragraphs),
+        "substantive_paragraph_count": len(evidence_paragraphs),
         "cited_substantive_paragraph_count": len(cited_paragraphs),
         "inline_citation_rate": round(citation_rate, 3),
         "references_only": references_only,

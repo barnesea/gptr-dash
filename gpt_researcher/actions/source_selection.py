@@ -77,6 +77,14 @@ AUTH_HOST_PREFIXES = ("account.", "accounts.", "auth.", "login.")
 CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
 URL_PATTERN = re.compile(r"https?://[^\s\]\)>\",;]+", re.IGNORECASE)
+PREDATION_QUERY_PATTERN = re.compile(
+    r"\b(?:predators?|predation|prey|what eats|natural enemies)\b",
+    re.IGNORECASE,
+)
+PREDATION_EVIDENCE_PATTERN = re.compile(
+    r"\b(?:predators?|predation|prey|eats?|eaten|feeds? on|natural enemies)\b",
+    re.IGNORECASE,
+)
 
 
 def source_url(candidate: dict[str, Any]) -> str:
@@ -213,6 +221,16 @@ def post_scrape_integrity_reason(
     }
     if not has_meaningful_query_anchor(query, content_card):
         return "post-scrape reject: fetched page has no meaningful query-anchor coverage"
+    if (
+        PREDATION_QUERY_PATTERN.search(query or "")
+        and not PREDATION_EVIDENCE_PATTERN.search(
+            f"{scraped.get('title', '')} {raw_content}"
+        )
+    ):
+        return (
+            "post-scrape reject: fetched page covers the subject but not "
+            "the requested predation relationship"
+        )
 
     # A SERP title and a fetched title normally share at least one distinctive
     # term.  Do not reject pages with no usable title (PDFs often lack one), but
@@ -302,6 +320,11 @@ def _candidate_score(
         "fallback": 0,
         "reject": -10,
     }[tier]
+    if (
+        PREDATION_QUERY_PATTERN.search(query or "")
+        and not PREDATION_EVIDENCE_PATTERN.search(haystack)
+    ):
+        score -= 12
     domain = source_domain(source_url(candidate))
     if (
         domain == "doi.org"

@@ -107,6 +107,33 @@ def test_selector_auto_skips_llm_for_decisive_fallback_score_gap():
         },
     ]
     assert not should_use_model_selector(query, candidates, "auto")
+
+
+def test_predation_query_prefers_answer_bearing_reputable_source():
+    candidates = [
+        {
+            "href": "https://www.fisheries.noaa.gov/species/hawksbill-turtle",
+            "title": "Hawksbill Turtle",
+            "body": "Sea turtle life stages, habitat, conservation, and fisheries.",
+        },
+        {
+            "href": (
+                "https://www.seaturtlestatus.org/articles/"
+                "faq-what-are-the-natural-predators-of-sea-turtles"
+            ),
+            "title": "Natural predators of sea turtles",
+            "body": "Sharks and killer whales prey on adult sea turtles.",
+        },
+    ]
+    selected, _ = deterministic_select_sources(
+        "natural predators of sea turtles by life stage",
+        candidates,
+        1,
+        strict=True,
+    )
+    assert source_url(selected[0]).startswith(
+        "https://www.seaturtlestatus.org/"
+    )
 from gpt_researcher.prompts import PromptFamily
 
 

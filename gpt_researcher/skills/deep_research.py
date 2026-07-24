@@ -1401,6 +1401,69 @@ enough."""
             details["corroborated"] = True
         return "evidence_ready", details
 
+    def _combine_repair_evidence(
+        self,
+        previous: Dict[str, Any],
+        replacement: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Preserve partial verified evidence when a repair fills its gap."""
+        combined_sources: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for source in [
+            *(previous.get("attempted_sources") or []),
+            *(replacement.get("attempted_sources") or []),
+        ]:
+            url = source_url(source)
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            combined_sources.append(source)
+        combined_context = "\n".join(
+            value
+            for value in (
+                str(previous.get("attempted_context") or ""),
+                str(replacement.get("attempted_context") or ""),
+            )
+            if value.strip()
+        )
+        previous_diagnostics = previous.get("retrieval_diagnostics") or {}
+        replacement_diagnostics = (
+            replacement.get("retrieval_diagnostics") or {}
+        )
+        combined_diagnostics = dict(replacement_diagnostics)
+        for key in (
+            "candidate_count",
+            "selected_count",
+            "scraped_count",
+            "accepted_count",
+            "integrity_rejected_count",
+        ):
+            combined_diagnostics[key] = int(
+                previous_diagnostics.get(key) or 0
+            ) + int(replacement_diagnostics.get(key) or 0)
+        state, details = self._coverage_state(
+            combined_context,
+            combined_sources,
+            combined_diagnostics,
+            aspect=replacement.get("aspect") or previous.get("aspect"),
+        )
+        replacement.update(
+            {
+                "attempted_context": combined_context,
+                "attempted_sources": combined_sources,
+                "retrieval_diagnostics": combined_diagnostics,
+                "coverage_state": state,
+                **details,
+            }
+        )
+        if state == "evidence_ready":
+            replacement["context"] = combined_context
+            replacement["sources"] = combined_sources
+        else:
+            replacement["context"] = ""
+            replacement["sources"] = []
+        return replacement
+
     @staticmethod
     def _coverage_ledger_entry(
         aspect: Dict[str, Any],
@@ -1707,6 +1770,7 @@ enough."""
                         'citations': processed['citations'],
                         'context': synthesis_context,
                         'sources': synthesis_sources,
+                        'attempted_context': context_text,
                         'attempted_sources': sources or [],
                         'retrieval_diagnostics': diagnostics,
                         'coverage_state': coverage_state,
@@ -1889,8 +1953,11 @@ enough."""
                     if replacement is None:
                         continue
                     aspect_id = str(replacement["aspect"].get("id"))
-                    latest_attempt_by_aspect[aspect_id] = replacement
                     best_previous = result_by_aspect.get(aspect_id, previous)
+                    replacement = self._combine_repair_evidence(
+                        best_previous, replacement
+                    )
+                    latest_attempt_by_aspect[aspect_id] = replacement
                     old_score, _ = self._branch_score(best_previous)
                     new_score, _ = self._branch_score(replacement)
                     improved = (
