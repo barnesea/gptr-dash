@@ -85,6 +85,22 @@ PREDATION_EVIDENCE_PATTERN = re.compile(
     r"\b(?:predators?|predation|prey|eats?|eaten|feeds? on|natural enemies)\b",
     re.IGNORECASE,
 )
+TURTLE_TARGET_PATTERN = re.compile(
+    r"\b(?:sea turtles?|freshwater turtles?|terrestrial turtles?|"
+    r"land turtles?|box turtles?|tortoises?|turtle (?:eggs?|nests?|"
+    r"hatchlings?|juveniles?|adults?))\b",
+    re.IGNORECASE,
+)
+CONCRETE_PREDATION_PATTERN = re.compile(
+    r"(?:"
+    r"\bpredators?\b.{0,100}\b(?:include|including|such as|are|is|:)\b"
+    r"|\b(?:include|including|such as)\b.{0,100}\bpredators?\b"
+    r"|\b(?:preyed (?:on|upon) by|eaten by)\b"
+    r"|\b(?:preys? (?:on|upon)|eats?|feeds? on)\b"
+    r"|\b(?:is|are)\b.{0,50}\b(?:turtle )?predators?\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def source_url(candidate: dict[str, Any]) -> str:
@@ -217,7 +233,10 @@ def post_scrape_integrity_reason(
     content_card = {
         "url": scraped.get("url", ""),
         "title": scraped.get("title", ""),
-        "body": raw_content[:4000],
+        # Scholarly pages often put the abstract after a long metadata/header
+        # block. This remains a bounded lexical check, but samples enough of the
+        # fetched page to avoid discarding a valid paper before compression.
+        "body": raw_content[:50000],
     }
     if not has_meaningful_query_anchor(query, content_card):
         return "post-scrape reject: fetched page has no meaningful query-anchor coverage"
@@ -276,13 +295,28 @@ def _anchor_tokens(query: str) -> set[str]:
     }
 
 
+def _token_variants(token: str) -> set[str]:
+    variants = {token}
+    if token.endswith("ies") and len(token) > 4:
+        variants.add(f"{token[:-3]}y")
+    if token.endswith("es") and len(token) > 4:
+        variants.add(token[:-2])
+    if token.endswith("s") and len(token) > 4:
+        variants.add(token[:-1])
+    return variants
+
+
 def has_meaningful_query_anchor(query: str, candidate: dict[str, Any]) -> bool:
     """Reject selector choices with no visible relationship to the query."""
     card = source_card(candidate, 0)
     haystack = (
         f"{card['title']} {card['snippet']} {_visible_url_text(card['url'])}"
     ).lower()
-    matches = {token for token in _anchor_tokens(query) if token in haystack}
+    matches = {
+        token
+        for token in _anchor_tokens(query)
+        if any(variant in haystack for variant in _token_variants(token))
+    }
     specific_matches = matches - GENERIC_QUERY_ANCHORS
     # A version, underscored identifier, or genuinely distinctive long term is
     # a strong single anchor; otherwise require two independent terms.  Generic
@@ -296,6 +330,71 @@ def has_meaningful_query_anchor(query: str, candidate: dict[str, Any]) -> bool:
             for token in specific_matches
         )
     )
+
+
+def has_requested_evidence_relation(
+    query: str,
+    text: str,
+    *,
+    required_scope_anchors: list[str] | None = None,
+) -> bool:
+    """Verify supported query relationships in retained evidence.
+
+    This deliberately handles only relationships with a safe deterministic
+    rule. Unsupported query types return True and continue to rely on semantic
+    retrieval plus scope checks.
+    """
+    if not PREDATION_QUERY_PATTERN.search(query or ""):
+        return True
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n|(?<=[.!?])\s+", text or "")
+        if paragraph.strip()
+    ]
+    claims = [
+        paragraph
+        for paragraph in paragraphs
+        if TURTLE_TARGET_PATTERN.search(paragraph)
+        and PREDATION_EVIDENCE_PATTERN.search(paragraph)
+        and CONCRETE_PREDATION_PATTERN.search(paragraph)
+    ]
+    if not claims:
+        return False
+    if not required_scope_anchors:
+        return True
+
+    def scope_patterns(anchor: str) -> tuple[str, ...]:
+        normalized = " ".join(anchor.lower().split())
+        if "terrestrial turtle" in normalized:
+            return (
+                r"\bterrestrial turtles?\b",
+                r"\bland turtles?\b",
+                r"\btortoises?\b",
+                r"\bbox turtles?\b",
+            )
+        if "freshwater turtle" in normalized:
+            return (
+                r"\bfreshwater turtles?\b",
+                r"\bpond turtles?\b",
+                r"\briver turtles?\b",
+            )
+        if "sea turtle" in normalized:
+            return (r"\bsea turtles?\b", r"\bmarine turtles?\b")
+        return (rf"\b{re.escape(normalized)}\b",)
+
+    return all(
+        any(
+            any(re.search(pattern, claim, re.IGNORECASE) for pattern in scope_patterns(anchor))
+            for claim in claims
+        )
+        for anchor in required_scope_anchors
+    )
+
+
+def requires_supported_evidence_relation(query: str) -> bool:
+    """Return whether deterministic relationship validation applies."""
+    return bool(PREDATION_QUERY_PATTERN.search(query or ""))
 
 
 def _candidate_score(

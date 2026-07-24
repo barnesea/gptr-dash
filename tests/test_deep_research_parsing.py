@@ -115,6 +115,31 @@ def test_partial_taxon_evidence_is_scope_missing():
     ]
 
 
+def test_scope_terms_without_scoped_predation_claim_are_not_ready():
+    skill = make_skill()
+    skill.original_query = "What are the natural predators of turtles?"
+    diagnostics = {
+        "candidate_count": 1,
+        "selected_count": 1,
+        "scraped_count": 1,
+        "accepted_count": 1,
+    }
+    state, details = skill._coverage_state(
+        (
+            "Sea turtles migrate through the ocean. Predators of freshwater "
+            "turtle nests include foxes and raccoons."
+        ),
+        [{"url": "https://www.nps.gov/example/turtles"}],
+        diagnostics,
+        aspect={
+            "question": "What are the natural predators of sea turtles?",
+            "required_scope_anchors": ["sea turtles"],
+        },
+    )
+    assert state == "compression_empty"
+    assert details["relationship_evidence_missing"] is True
+
+
 def test_repair_combines_partial_scope_instead_of_discarding_it():
     skill = make_skill()
     aspect = {

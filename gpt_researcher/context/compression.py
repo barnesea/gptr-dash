@@ -31,6 +31,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from ..memory.embeddings import OPENAI_EMBEDDING_MODEL
 from ..actions.source_selection import (
     has_meaningful_query_anchor,
+    has_requested_evidence_relation,
+    requires_supported_evidence_relation,
     source_quality_tier,
 )
 from ..prompts import PromptFamily
@@ -367,6 +369,43 @@ class ContextCompressor:
                 ]
                 if candidates:
                     rescue_mode = "verified_lexical_anchor"
+
+        # Semantic similarity can favor broad background passages over the
+        # actual relationship requested by the user. For supported relation
+        # types, promote verified chunks that contain a concrete claim even
+        # when ordinary threshold matches already exist.
+        if requires_supported_evidence_relation(query):
+            relation_candidates = [
+                item
+                for item in scored
+                if (
+                    item[2].metadata.get("source_tier")
+                    in {"primary", "reputable"}
+                    and has_requested_evidence_relation(
+                        query,
+                        item[2].page_content,
+                    )
+                )
+            ]
+            if relation_candidates:
+                relation_keys = {
+                    (
+                        item[1],
+                        str(item[2].metadata.get("source") or ""),
+                    )
+                    for item in relation_candidates
+                }
+                candidates = relation_candidates + [
+                    item
+                    for item in candidates
+                    if (
+                        item[1],
+                        str(item[2].metadata.get("source") or ""),
+                    )
+                    not in relation_keys
+                ]
+                rescue_used = True
+                rescue_mode = "verified_relation_anchor"
 
         accepted: list[Document] = []
         accepted_by_source: dict[str, int] = {}

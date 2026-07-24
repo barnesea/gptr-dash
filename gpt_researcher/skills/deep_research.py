@@ -15,6 +15,7 @@ from ..actions.query_processing import get_search_results
 from ..actions.source_selection import (
     extract_query_urls,
     has_meaningful_query_anchor,
+    has_requested_evidence_relation,
     source_domain,
     source_quality_tier,
     source_url,
@@ -1395,24 +1396,14 @@ enough."""
             return "no_qualified_source", details
         if tiers["primary"] + tiers["reputable"] + tiers["fallback"] == 0:
             return "no_qualified_source", details
-        evidence_text = " ".join(
-            [
-                str(context or ""),
-                *[
-                    " ".join(
-                        str(source.get(key) or "")
-                        for key in (
-                            "title",
-                            "url",
-                            "href",
-                            "raw_content",
-                            "content",
-                        )
-                    )
-                    for source in sources
-                ],
-            ]
-        ).lower()
+        evidence_text = str(context or "").lower()
+        if not has_requested_evidence_relation(
+            classification_query,
+            evidence_text,
+            required_scope_anchors=details["required_scope_anchors"],
+        ):
+            details["relationship_evidence_missing"] = True
+            return "compression_empty", details
         evidence_tokens = _aspect_tokens(evidence_text)
         for scope_anchor in details["required_scope_anchors"]:
             normalized_anchor = " ".join(

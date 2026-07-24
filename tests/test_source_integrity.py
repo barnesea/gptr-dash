@@ -2,6 +2,7 @@ from gpt_researcher.actions.source_selection import (
     deterministic_select_sources,
     extract_query_urls,
     has_meaningful_query_anchor,
+    has_requested_evidence_relation,
     post_scrape_integrity_reason,
     source_quality_tier,
     source_url,
@@ -86,6 +87,48 @@ def test_post_scrape_integrity_requires_requested_predation_evidence():
         scraped,
     )
     assert "requested predation relationship" in reason
+
+
+def test_post_scrape_integrity_checks_scholarly_content_after_long_header():
+    candidate = _card(
+        "https://pmc.ncbi.nlm.nih.gov/articles/example/",
+        "Survival of freshwater turtle nests",
+        "Freshwater turtle nest survival study.",
+    )
+    scraped = {
+        "url": candidate["href"],
+        "title": candidate["title"],
+        "raw_content": (
+            ("journal metadata navigation " * 300)
+            + "The main predators of freshwater turtle nests include red "
+            "foxes and raccoons."
+        ),
+    }
+    assert (
+        post_scrape_integrity_reason(
+            "natural predators of freshwater turtles primary research paper",
+            candidate,
+            scraped,
+        )
+        is None
+    )
+
+
+def test_predation_relation_must_match_each_required_scope():
+    context = (
+        "Predators of freshwater turtle nests include foxes and raccoons. "
+        "Sea turtles have flippers and migrate long distances."
+    )
+    assert has_requested_evidence_relation(
+        "natural predators of freshwater turtles",
+        context,
+        required_scope_anchors=["freshwater turtles"],
+    )
+    assert not has_requested_evidence_relation(
+        "natural predators of sea turtles",
+        context,
+        required_scope_anchors=["sea turtles"],
+    )
 
 
 def test_hugging_face_title_normalization_accepts_concatenated_extracted_title():
