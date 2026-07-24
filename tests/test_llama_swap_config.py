@@ -76,6 +76,16 @@ def test_llama_swap_skips_non_chat_running_routes(monkeypatch):
                         "name": "ComfyUI Test RTX PRO 6000",
                     },
                     {
+                        "model": "jina-v5-retrieval",
+                        "state": "ready",
+                        "cmd": (
+                            "docker run vllm/vllm-openai:nightly "
+                            "jinaai/jina-embeddings-v5-text-small-retrieval "
+                            "--runner pooling --served-model-name jina-v5-retrieval"
+                        ),
+                        "proxy": "http://host.docker.internal:14009",
+                    },
+                    {
                         "model": "laguna-s-2.1-nvfp4",
                         "state": "ready",
                         "cmd": "docker run vllm/vllm-openai:nightly --served-model-name laguna-s-2.1-nvfp4",
@@ -92,6 +102,36 @@ def test_llama_swap_skips_non_chat_running_routes(monkeypatch):
     assert cfg.fast_llm == "openai:laguna-s-2.1-nvfp4"
     assert cfg.smart_llm == "openai:laguna-s-2.1-nvfp4"
     assert cfg.strategic_llm == "openai:laguna-s-2.1-nvfp4"
+
+
+def test_llama_swap_does_not_select_pooling_route_as_chat_model(monkeypatch):
+    clear_llm_env(monkeypatch)
+
+    def fake_urlopen(url, timeout):
+        return FakeResponse(
+            {
+                "running": [
+                    {
+                        "model": "jina-v5-retrieval",
+                        "state": "ready",
+                        "cmd": (
+                            "docker run vllm/vllm-openai:nightly "
+                            "jinaai/jina-embeddings-v5-text-small-retrieval "
+                            "--runner pooling"
+                        ),
+                        "proxy": "http://host.docker.internal:14009",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    cfg = Config()
+
+    assert cfg.fast_llm == DEFAULT_CONFIG["FAST_LLM"]
+    assert cfg.smart_llm == DEFAULT_CONFIG["SMART_LLM"]
+    assert cfg.strategic_llm == DEFAULT_CONFIG["STRATEGIC_LLM"]
 
 
 def test_llama_swap_does_not_select_non_chat_running_route(monkeypatch):

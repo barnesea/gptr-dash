@@ -263,6 +263,11 @@ class Config:
             "flux",
             "image generation",
             "diffusion",
+            "--runner pooling",
+            "/v1/embeddings",
+            "embedding",
+            "reranker",
+            "rerank",
         )
         if any(marker in haystack for marker in non_chat_markers):
             return False
