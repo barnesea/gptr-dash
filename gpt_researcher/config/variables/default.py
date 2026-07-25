@@ -35,7 +35,18 @@ DEFAULT_CONFIG: BaseConfig = {
     "RETRIEVAL_PIPELINE_MODE": "legacy",
     "SOURCE_EVIDENCE_JUDGE_MODE": "all",
     "SOURCE_EVIDENCE_JUDGE_FALLBACK": "hybrid",
+    # Retain relevant but non-conclusive evidence with explicit labels instead
+    # of silently treating it as synthesis-ready or discarding it.
+    "LABELED_EVIDENCE_POOL_ENABLED": False,
+    "LABELED_EVIDENCE_MIN_CONFIDENCE": 0.20,
     "CANONICAL_CONTENT_RESOLUTION": True,
+    # Define the named subject and its supporting concepts with a small set of
+    # preliminary searches before planning deeper work. Deployments can enable
+    # this independently from retrieval pipeline v2 for a clean rollback.
+    "SUBJECT_GROUNDING_ENABLED": False,
+    "SUBJECT_GROUNDING_MAX_SUBJECTS": 4,
+    "SUBJECT_GROUNDING_RESULTS_PER_QUERY": 3,
+    "SUBJECT_GROUNDING_SEARCH_CONCURRENCY": 4,
     "MEMORY_BACKEND": "local",
     "TOTAL_WORDS": 1200,
     "REPORT_FORMAT": "APA",
@@ -66,6 +77,10 @@ DEFAULT_CONFIG: BaseConfig = {
     "DEEP_RESEARCH_BRANCH_MODE": "auto",
     "DEEP_RESEARCH_MAX_DEEPENED_BRANCHES": 1,
     "DEEP_RESEARCH_MIN_DEEPENING_SCORE": 8,
+    # "strongest" preserves the earlier ranked-tree behavior. Deployments can
+    # use gap_first to spend follow-up work on the most important unresolved
+    # aspect before adding detail to already well-supported branches.
+    "DEEP_RESEARCH_DEEPENING_STRATEGY": "strongest",
     "DEEP_RESEARCH_SOURCE_STANDARDS": True,
     "DEEP_RESEARCH_DIRECT_URL_SEED": False,
     # auto uses the fast selector only when deterministic evidence is genuinely

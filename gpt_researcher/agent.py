@@ -33,6 +33,7 @@ from .utils.enum import ReportSource, ReportType, Tone
 from .utils.llm import create_chat_completion
 from .utils.research_trajectory import ResearchTrajectory
 from .utils.research_budget import ResearchPolicy
+from .utils.subject_grounding import subject_grounding_context
 from .vector_store import VectorStoreWrapper
 
 
@@ -95,6 +96,7 @@ class GPTResearcher:
         seed_candidates: list[dict[str, Any]] | None = None,
         research_aspect: dict[str, Any] | None = None,
         excluded_candidate_urls: list[str] | None = None,
+        subject_grounding: dict[str, Any] | None = None,
         **kwargs
     ):
         """
@@ -167,6 +169,7 @@ class GPTResearcher:
             excluded_candidate_urls or []
         )
         self.coverage_ledger: list[dict[str, Any]] = []
+        self.subject_grounding = dict(subject_grounding or {})
         self._owns_trajectory = False
         if (
             trajectory is None
@@ -566,13 +569,14 @@ class GPTResearcher:
         })
 
         # Generate report with available images embedded
-        report = await self.report_generator.write_report(
-            existing_headers=existing_headers,
-            relevant_written_contents=relevant_written_contents,
-            ext_context=ext_context or self.context,
-            custom_prompt=custom_prompt,
-            available_images=self.available_images,  # Pass pre-generated images
-        )
+        with subject_grounding_context(self.subject_grounding):
+            report = await self.report_generator.write_report(
+                existing_headers=existing_headers,
+                relevant_written_contents=relevant_written_contents,
+                ext_context=ext_context or self.context,
+                custom_prompt=custom_prompt,
+                available_images=self.available_images,  # Pass pre-generated images
+            )
 
         await self._log_event("research", step="report_completed", details={
             "report_length": len(report),
@@ -590,7 +594,10 @@ class GPTResearcher:
             The generated conclusion text.
         """
         await self._log_event("research", step="writing_conclusion")
-        conclusion = await self.report_generator.write_report_conclusion(report_body)
+        with subject_grounding_context(self.subject_grounding):
+            conclusion = await self.report_generator.write_report_conclusion(
+                report_body
+            )
         await self._log_event("research", step="conclusion_completed")
         return conclusion
 
@@ -601,7 +608,8 @@ class GPTResearcher:
             The generated introduction text.
         """
         await self._log_event("research", step="writing_introduction")
-        intro = await self.report_generator.write_introduction()
+        with subject_grounding_context(self.subject_grounding):
+            intro = await self.report_generator.write_introduction()
         await self._log_event("research", step="introduction_completed")
         return intro
 

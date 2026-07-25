@@ -284,6 +284,50 @@ def test_partial_scope_evidence_is_preserved_as_ready_child_coverage():
     assert ledger["partial_scope"] is True
 
 
+def test_non_ready_aspect_relabels_direct_evidence_as_provisional():
+    skill = make_skill()
+    source = {
+        "url": "https://field-notes.example/atlasdb-tuning",
+        "title": "AtlasDB operator tuning notes",
+        "_gptr_evidence_role": "practitioner",
+        "_gptr_evidence_judgment": {
+            "accepted_for_synthesis": True,
+            "retained_in_evidence_pool": True,
+            "claim_status": "synthesis_ready",
+            "evidence_strength": "moderate",
+            "confidence": 0.82,
+            "confidence_label": "high",
+            "evidence_application": "direct",
+            "applicability": "partial",
+            "supported_claims": [
+                "One operator reports using a larger cache for AtlasDB v4."
+            ],
+        },
+    }
+
+    ledger = skill._coverage_ledger_entry(
+        {
+            "id": "configuration",
+            "question": "How should AtlasDB v4 be configured?",
+        },
+        {
+            "query": "AtlasDB v4 configuration",
+            "coverage_state": "compression_empty",
+            "sources": [source],
+            "attempted_sources": [source],
+        },
+    )
+
+    assert ledger["verified_sources"] == []
+    assert ledger["provisional_urls"] == [source["url"]]
+    label = ledger["provisional_sources"][0]
+    assert label["claim_status"] == "provisional"
+    assert label["judged_claim_status"] == "synthesis_ready"
+    assert label["accepted_for_synthesis"] is False
+    assert label["judged_accepted_for_synthesis"] is True
+    assert "compression_empty" in label["effective_relabel_reason"]
+
+
 @pytest.mark.asyncio
 async def test_scope_repair_targets_only_missing_anchor(monkeypatch):
     skill = make_skill()
@@ -359,6 +403,35 @@ def test_repair_combines_partial_scope_instead_of_discarding_it():
     assert len(combined["sources"]) == 2
     assert "Freshwater turtles" in combined["context"]
     assert "Terrestrial turtles" in combined["context"]
+
+
+def test_merge_results_deduplicates_canonical_source_variants():
+    merged = DeepResearchSkill._merge_results(
+        [
+            {
+                "sources": [
+                    {
+                        "url": (
+                            "https://www.krea.ai/blog/"
+                            "krea-2-lora-training"
+                        )
+                    }
+                ]
+            },
+            {
+                "sources": [
+                    {
+                        "url": (
+                            "https://krea.ai/blog/"
+                            "krea-2-lora-training"
+                        )
+                    }
+                ]
+            },
+        ]
+    )
+
+    assert len(merged["sources"]) == 1
 
 
 def test_aspect_query_encodes_expected_primary_evidence_standard():
@@ -655,6 +728,45 @@ def make_skill() -> DeepResearchSkill:
         mcp_strategy=None,
     )
     return DeepResearchSkill(researcher)
+
+
+def test_gap_first_deepening_prioritizes_missing_high_priority_coverage():
+    skill = make_skill()
+    skill.deepening_strategy = "gap_first"
+    ready = {
+        "coverage_state": "evidence_ready",
+        "aspect": {"id": "details", "priority": 3},
+        "query": "well supported details",
+        "context": "substantial evidence",
+    }
+    gap = {
+        "coverage_state": "scope_missing",
+        "aspect": {
+            "id": "core",
+            "priority": 1,
+            "question": "How does the named system perform the requested task?",
+            "search_query": "named system requested task",
+        },
+        "query": "named system requested task",
+        "missing_scope_anchors": ["requested mode"],
+        "context": "",
+    }
+
+    ready_score, _ = skill._deepening_selection_score(ready, 80)
+    gap_score, reason = skill._deepening_selection_score(gap, 5)
+
+    assert gap_score > ready_score
+    assert "scope_missing" in reason
+    assert skill._eligible_for_deepening(
+        gap,
+        {
+            "score": 0,
+            "distinct_sources": 0,
+            "query_anchored_sources": 0,
+            "context_chars": 0,
+        },
+    )
+    assert "Missing scope anchors" in skill._deepening_prompt(gap)
 
 
 @pytest.mark.asyncio

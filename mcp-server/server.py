@@ -478,6 +478,15 @@ def check_research_dependency_status() -> Dict[str, Any]:
             "canonical_content_resolution": os.getenv(
                 "CANONICAL_CONTENT_RESOLUTION", "true"
             ),
+            "subject_grounding_enabled": os.getenv(
+                "SUBJECT_GROUNDING_ENABLED", "false"
+            ),
+            "subject_grounding_max_subjects": os.getenv(
+                "SUBJECT_GROUNDING_MAX_SUBJECTS", "4"
+            ),
+            "subject_grounding_results_per_query": os.getenv(
+                "SUBJECT_GROUNDING_RESULTS_PER_QUERY", "3"
+            ),
             "source_selector_mode": os.getenv("SOURCE_SELECTOR_MODE", ""),
             "research_trajectory_enabled": os.getenv("RESEARCH_TRAJECTORY_ENABLED", ""),
             "research_trajectory_dir": os.getenv("RESEARCH_TRAJECTORY_DIR", ""),
@@ -730,8 +739,32 @@ async def _run_deep_research(
                 if str(url).strip()
             }
         )
+        evidence_pool_sources_by_url: dict[str, dict[str, Any]] = {}
+        for item in researcher.coverage_ledger:
+            for source in item.get("evidence_pool_sources", []):
+                url = str(source.get("url") or "").strip()
+                if not url:
+                    continue
+                evidence_pool_sources_by_url[url.rstrip("/").lower()] = {
+                    **source,
+                    "url": url,
+                    "aspect_id": item.get("aspect_id"),
+                    "aspect_state": item.get("state"),
+                }
+        evidence_pool_sources = list(
+            evidence_pool_sources_by_url.values()
+        )
+        evidence_pool_urls = [
+            source["url"] for source in evidence_pool_sources
+        ]
+        retained_source_urls = {
+            *(url.rstrip("/").lower() for url in source_urls),
+            *(url.rstrip("/").lower() for url in evidence_pool_urls),
+        }
         excluded_source_urls = [
-            url for url in retrieved_source_urls if url not in source_urls
+            url
+            for url in retrieved_source_urls
+            if url.rstrip("/").lower() not in retained_source_urls
         ]
         response: Dict[str, Any] = {
             "answer_ready": False,
@@ -757,11 +790,27 @@ async def _run_deep_research(
             "source_count": len(sources),
             "sources": format_sources_for_response(sources),
             "source_urls": source_urls,
+            "evidence_pool_source_count": len(evidence_pool_sources),
+            "evidence_pool_sources": evidence_pool_sources,
+            "evidence_pool_urls": evidence_pool_urls,
+            "provisional_source_count": sum(
+                source.get("claim_status") == "provisional"
+                for source in evidence_pool_sources
+            ),
+            "background_source_count": sum(
+                source.get("claim_status") == "background"
+                for source in evidence_pool_sources
+            ),
             "retrieved_source_count": len(retrieved_source_urls),
             "retrieved_source_urls": retrieved_source_urls,
             "excluded_source_count": len(excluded_source_urls),
             "excluded_source_urls": excluded_source_urls,
             "coverage_ledger": researcher.coverage_ledger,
+            "subject_grounding": getattr(
+                researcher,
+                "subject_grounding",
+                {},
+            ),
             "executed_work_units": (
                 researcher.deep_researcher._executed_work_units
                 if researcher.deep_researcher
@@ -788,7 +837,8 @@ async def _run_deep_research(
                 ),
                 "preliminary_reuse_count": sum(
                     any(
-                        discovery.get("stage") == "preliminary"
+                        discovery.get("stage")
+                        in {"preliminary", "subject_grounding"}
                         for discovery in entry.get("discoveries", [])
                     )
                     and bool(entry.get("assigned_aspects"))

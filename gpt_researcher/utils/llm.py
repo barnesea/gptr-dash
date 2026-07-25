@@ -21,6 +21,7 @@ from gpt_researcher.llm_provider.generic.base import (
 
 from ..prompts import PromptFamily
 from .costs import calculate_llm_cost
+from .subject_grounding import inject_subject_grounding
 from .validators import Subtopics
 
 
@@ -108,6 +109,7 @@ async def create_chat_completion(
             "Check your FAST_TOKEN_LIMIT / SMART_TOKEN_LIMIT / "
             "STRATEGIC_TOKEN_LIMIT env vars for typos."
         )
+    messages = inject_subject_grounding(messages)
 
     # Get the provider from supported providers
     provider_kwargs = {'model': model}

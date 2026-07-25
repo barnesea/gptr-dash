@@ -26,6 +26,31 @@ BARE_URL_PATTERN = re.compile(
     r"(?<!\()https?://[^\s<>\])]+",
     re.IGNORECASE,
 )
+SUPPLEMENTAL_QUALIFICATION_PATTERN = re.compile(
+    r"\b(?:according to|reports?|reported|practitioner|community|"
+    r"anecdotal|preliminary|provisional|tentative|unconfirmed|"
+    r"background|context only|low confidence|medium confidence|"
+    r"adjacent|partially applicable)\b",
+    re.IGNORECASE,
+)
+APPLICABILITY_QUALIFICATION_PATTERN = re.compile(
+    r"\b(?:partial(?:ly)? applicable|partial applicability|adjacent|"
+    r"context only|supported scope|applies only|not specific to|"
+    r"does not specifically|cannot be transferred|corroborated "
+    r"practitioner)\b",
+    re.IGNORECASE,
+)
+EVIDENCE_LIMITATION_PATTERN = re.compile(
+    r"\b(?:gap|insufficient|missing|not researched|not established|"
+    r"unresolved|unknown|could not verify|no verified evidence|"
+    r"no verified urls?|not matched|unverified|precludes|cannot support|"
+    r"required scope anchors?|incomplete|scope_missing|scrape_failure|"
+    r"compression_empty|evidence limitation|uncited synthesis|"
+    r"not independently verified|lacks?|lacking|no direct evidence|"
+    r"provisional|tentative|partial(?:ly)? applicable|"
+    r"not synthesis-ready|not wholly synthesis-ready|supported scope)\b",
+    re.IGNORECASE,
+)
 
 
 def _normalized_citation_url(url: str) -> str:
@@ -99,14 +124,237 @@ def enforce_verified_citation_urls(
     return f"{body}\n\n## References\n\n{references}\n"
 
 
+def qualify_supplemental_evidence_paragraphs(
+    report: str,
+    coverage_ledger: list[dict[str, Any]] | None = None,
+) -> str:
+    """Label cited provisional/background evidence at its point of use.
+
+    The report writer receives the same evidence labels, but a deterministic
+    last pass is still necessary because a model can preserve a supplemental
+    citation while dropping its qualifier during drafting or correction.
+    """
+    evidence_by_url: dict[str, dict[str, Any]] = {}
+    for aspect in coverage_ledger or []:
+        for source in aspect.get("evidence_pool_sources", []) or []:
+            status = str(source.get("claim_status") or "").strip().lower()
+            applicability = str(
+                source.get("applicability") or "exact"
+            ).strip().lower()
+            role = str(
+                source.get("evidence_role") or ""
+            ).strip().lower()
+            normalized = _normalized_citation_url(source.get("url"))
+            if normalized and (
+                status in {"provisional", "background"}
+                or applicability in {"partial", "adjacent", "context"}
+                or role == "practitioner"
+            ):
+                evidence_by_url[normalized] = source
+    if not evidence_by_url:
+        return report
+
+    reference_match = REFERENCE_HEADING_PATTERN.search(report or "")
+    if reference_match:
+        body = (report or "")[: reference_match.start()].rstrip()
+        references = (report or "")[reference_match.start() :].lstrip()
+    else:
+        body = report or ""
+        references = ""
+
+    def conservative_label(
+        sources: list[dict[str, Any]],
+    ) -> str:
+        statuses = {
+            str(source.get("claim_status") or "").strip().lower()
+            for source in sources
+        }
+        roles = {
+            str(source.get("evidence_role") or "").strip().lower()
+            for source in sources
+        }
+        confidence_order = {"low": 0, "medium": 1, "high": 2}
+        confidence = min(
+            (
+                str(source.get("confidence_label") or "low")
+                .strip()
+                .lower()
+                for source in sources
+            ),
+            key=lambda value: confidence_order.get(value, 0),
+            default="low",
+        )
+        applicability_order = {
+            "unrelated": 0,
+            "context": 1,
+            "adjacent": 2,
+            "partial": 3,
+            "exact": 4,
+        }
+        applicability = min(
+            (
+                str(source.get("applicability") or "context")
+                .strip()
+                .lower()
+                for source in sources
+            ),
+            key=lambda value: applicability_order.get(value, 0),
+            default="context",
+        )
+        if statuses == {"provisional"}:
+            label = (
+                "provisional practitioner evidence"
+                if roles == {"practitioner"}
+                else "provisional supplemental evidence"
+            )
+            qualifiers = ["tentative"]
+        elif statuses == {"background"}:
+            label = (
+                "background practitioner context"
+                if roles == {"practitioner"}
+                else "background or contextual evidence"
+            )
+            qualifiers = ["not synthesis-ready"]
+        elif statuses == {"synthesis_ready"}:
+            if roles == {"practitioner"}:
+                label = "corroborated practitioner evidence"
+            elif applicability == "partial":
+                label = "partially applicable evidence"
+            elif applicability in {"adjacent", "context"}:
+                label = "adjacent or contextual evidence"
+            else:
+                label = "qualified evidence"
+            qualifiers = ["synthesis-ready only within its supported scope"]
+        elif "synthesis_ready" in statuses:
+            label = "mixed verified and supplemental evidence"
+            qualifiers = ["not wholly synthesis-ready"]
+        else:
+            label = "mixed provisional and background evidence"
+            qualifiers = ["not synthesis-ready"]
+        scopes = list(
+            dict.fromkeys(
+                str(value).strip()
+                for source in sources
+                for value in (
+                    source.get("supported_scope")
+                    or source.get("supported_entities")
+                    or []
+                )
+                if str(value).strip()
+            )
+        )
+        qualifiers.extend(
+            [f"{confidence} confidence", f"{applicability} applicability"]
+        )
+        if scopes:
+            qualifiers.append("scope: " + ", ".join(scopes[:3]))
+        return f"*Evidence label: {label}; {'; '.join(qualifiers)}*"
+
+    blocks = re.split(r"(\n\s*\n)", body)
+    for index in range(0, len(blocks), 2):
+        paragraph = blocks[index]
+        if (
+            not paragraph.strip()
+            or paragraph.lstrip().startswith(("#", "```", ">", "|"))
+        ):
+            continue
+        cited_sources = [
+            evidence_by_url[normalized]
+            for normalized in {
+                _normalized_citation_url(url)
+                for url in report_citation_urls(paragraph)
+            }
+            if normalized in evidence_by_url
+        ]
+        if not cited_sources:
+            continue
+        qualification_text = MARKDOWN_LINK_PATTERN.sub(
+            lambda match: match.group(1),
+            paragraph,
+        )
+        statuses = {
+            str(source.get("claim_status") or "").strip().lower()
+            for source in cited_sources
+        }
+        roles = {
+            str(source.get("evidence_role") or "").strip().lower()
+            for source in cited_sources
+        }
+        nonexact = any(
+            str(source.get("applicability") or "exact").strip().lower()
+            in {"partial", "adjacent", "context"}
+            for source in cited_sources
+        )
+        if statuses <= {"provisional", "background"} and (
+            SUPPLEMENTAL_QUALIFICATION_PATTERN.search(qualification_text)
+        ):
+            continue
+        if statuses == {"synthesis_ready"} and nonexact and (
+            APPLICABILITY_QUALIFICATION_PATTERN.search(qualification_text)
+        ):
+            continue
+        if (
+            statuses == {"synthesis_ready"}
+            and not nonexact
+            and roles == {"practitioner"}
+            and SUPPLEMENTAL_QUALIFICATION_PATTERN.search(qualification_text)
+        ):
+            continue
+        blocks[index] = (
+            f"{paragraph.rstrip()} {conservative_label(cited_sources)}"
+        )
+
+    qualified = "".join(blocks).rstrip()
+    if references:
+        return f"{qualified}\n\n{references}"
+    return qualified
+
+
+def qualify_uncited_synthesis_paragraphs(report: str) -> str:
+    """Mark substantive uncited synthesis locally instead of relying on a banner."""
+    reference_match = REFERENCE_HEADING_PATTERN.search(report or "")
+    if reference_match:
+        body = (report or "")[: reference_match.start()].rstrip()
+        references = (report or "")[reference_match.start() :].lstrip()
+    else:
+        body = report or ""
+        references = ""
+    blocks = re.split(r"(\n\s*\n)", body)
+    for index in range(0, len(blocks), 2):
+        paragraph = blocks[index]
+        normalized = re.sub(r"\s+", " ", paragraph).strip()
+        if (
+            len(normalized) < 80
+            or paragraph.lstrip().startswith(("#", "```", ">", "|"))
+            or INLINE_LINK_PATTERN.search(paragraph)
+            or EVIDENCE_LIMITATION_PATTERN.search(paragraph)
+            or paragraph.lstrip().startswith("*Evidence label:")
+        ):
+            continue
+        blocks[index] = (
+            f"{paragraph.rstrip()} *Evidence label: uncited synthesis; "
+            "not independently verified*"
+        )
+    qualified = "".join(blocks).rstrip()
+    if references:
+        return f"{qualified}\n\n{references}"
+    return qualified
+
+
 def report_quality_diagnostics(
     report: str,
     coverage_ledger: list[dict[str, Any]] | None = None,
     *,
     query: str = "",
+    supplemental_source_urls: list[str] | None = None,
 ) -> dict[str, Any]:
     """Check report claims against coverage state and inline-citation rules."""
     coverage_ledger = coverage_ledger or []
+    supplemental_urls = {
+        _normalized_citation_url(url)
+        for url in (supplemental_source_urls or [])
+        if _normalized_citation_url(url)
+    }
     parts = REFERENCE_HEADING_PATTERN.split(report or "", maxsplit=1)
     body = parts[0].strip()
     references = parts[1] if len(parts) > 1 else ""
@@ -149,17 +397,10 @@ def report_quality_diagnostics(
             body_lower,
         )
     )
-    limitation_terms = re.compile(
-        r"\b(?:gap|insufficient|missing|not researched|not established|"
-        r"unresolved|unknown|could not verify|no verified evidence|"
-        r"no verified urls?|not matched|unverified|precludes|cannot support|"
-        r"required scope anchors?|incomplete|scope_missing|scrape_failure|"
-        r"compression_empty|evidence limitation)\b"
-    )
     evidence_paragraphs = [
         paragraph
         for paragraph in paragraphs
-        if not limitation_terms.search(paragraph.lower())
+        if not EVIDENCE_LIMITATION_PATTERN.search(paragraph)
     ]
     cited_paragraphs = [
         paragraph
@@ -175,11 +416,7 @@ def report_quality_diagnostics(
     for item in coverage_ledger:
         if item.get("state") == "evidence_ready":
             continue
-        anchors = (
-            item.get("missing_scope_anchors")
-            or item.get("required_scope_anchors")
-            or []
-        )
+        anchors = item.get("missing_scope_anchors") or []
         for anchor in anchors:
             normalized = " ".join(str(anchor).lower().split())
             if not normalized:
@@ -188,10 +425,79 @@ def report_quality_diagnostics(
                 paragraph_lower = paragraph.lower()
                 if (
                     normalized in paragraph_lower
-                    and not limitation_terms.search(paragraph_lower)
+                    and not EVIDENCE_LIMITATION_PATTERN.search(paragraph)
                 ):
                     unsupported_scope_claims.append(str(anchor))
                     break
+    unlabeled_supplemental_paragraphs = []
+    qualified_evidence_by_url: dict[str, dict[str, Any]] = {}
+    for item in coverage_ledger:
+        for source in item.get("evidence_pool_sources", []) or []:
+            normalized = _normalized_citation_url(source.get("url"))
+            status = str(source.get("claim_status") or "").strip().lower()
+            applicability = str(
+                source.get("applicability") or "exact"
+            ).strip().lower()
+            role = str(
+                source.get("evidence_role") or ""
+            ).strip().lower()
+            if normalized and status == "synthesis_ready" and (
+                applicability in {"partial", "adjacent", "context"}
+                or role == "practitioner"
+            ):
+                qualified_evidence_by_url[normalized] = source
+    unlabeled_applicability_paragraphs = []
+    for paragraph in paragraphs:
+        cited_urls = {
+            _normalized_citation_url(url)
+            for url in report_citation_urls(paragraph)
+        }
+        qualification_text = MARKDOWN_LINK_PATTERN.sub(
+            lambda match: match.group(1),
+            paragraph,
+        )
+        if (
+            cited_urls & supplemental_urls
+            and not SUPPLEMENTAL_QUALIFICATION_PATTERN.search(
+                qualification_text
+            )
+        ):
+            unlabeled_supplemental_paragraphs.append(
+                re.sub(r"\s+", " ", paragraph)[:240]
+            )
+        cited_qualified_sources = [
+            qualified_evidence_by_url[url]
+            for url in cited_urls
+            if url in qualified_evidence_by_url
+        ]
+        if not cited_qualified_sources:
+            continue
+        needs_applicability_label = any(
+            str(source.get("applicability") or "exact").strip().lower()
+            in {"partial", "adjacent", "context"}
+            for source in cited_qualified_sources
+        )
+        needs_practitioner_label = any(
+            str(source.get("evidence_role") or "").strip().lower()
+            == "practitioner"
+            for source in cited_qualified_sources
+        )
+        applicability_labeled = (
+            not needs_applicability_label
+            or APPLICABILITY_QUALIFICATION_PATTERN.search(
+                qualification_text
+            )
+        )
+        practitioner_labeled = (
+            not needs_practitioner_label
+            or SUPPLEMENTAL_QUALIFICATION_PATTERN.search(
+                qualification_text
+            )
+        )
+        if not applicability_labeled or not practitioner_labeled:
+            unlabeled_applicability_paragraphs.append(
+                re.sub(r"\s+", " ", paragraph)[:240]
+            )
     # Preserve the existing high-confidence taxonomy guard while the v2
     # evidence judge handles arbitrary requested relationships. This is a
     # compatibility safety net, not part of retrieval ranking.
@@ -230,6 +536,16 @@ def report_quality_diagnostics(
             "report presents unresolved scope as established: "
             + ", ".join(sorted(set(unsupported_scope_claims)))
         )
+    if unlabeled_supplemental_paragraphs:
+        issues.append(
+            "supplemental evidence is presented without an explicit "
+            "provisional, practitioner, background, or applicability label"
+        )
+    if unlabeled_applicability_paragraphs:
+        issues.append(
+            "partial, adjacent, or practitioner evidence is presented "
+            "without its applicability or provenance label"
+        )
     if category_error:
         issues.append(
             "report may classify disease, parasites, microbes, or "
@@ -251,6 +567,12 @@ def report_quality_diagnostics(
         "unsupported_comprehensive_claim": unsupported_comprehensive,
         "unsupported_primary_claim": unsupported_primary,
         "unsupported_scope_claims": sorted(set(unsupported_scope_claims)),
+        "unlabeled_supplemental_paragraphs": (
+            unlabeled_supplemental_paragraphs
+        ),
+        "unlabeled_applicability_paragraphs": (
+            unlabeled_applicability_paragraphs
+        ),
         "category_error": category_error,
         "predator_immunity_overclaim": predator_immunity_overclaim,
     }
@@ -262,6 +584,7 @@ async def repair_report_evidence_safety(
     query: str,
     coverage_ledger: list[dict[str, Any]],
     verified_source_urls: list[str],
+    supplemental_source_urls: list[str] | None = None,
     diagnostics: dict[str, Any],
     cfg: Config,
     cost_callback: callable = None,
@@ -274,16 +597,30 @@ User query: {query}
 Problems: {diagnostics.get("issues", [])}
 Coverage ledger: {json.dumps(coverage_ledger, ensure_ascii=False)}
 Verified URL allowlist: {json.dumps(verified_source_urls)}
+Supplemental labeled URL allowlist: {json.dumps(supplemental_source_urls or [])}
 
 Rules:
 - Preserve supported content, but remove or narrow unsupported claims.
-- Use facts only from aspects whose state is evidence_ready.
+- State unqualified facts only from synthesis-ready evidence in aspects whose
+  state is evidence_ready.
+- Supplemental provisional evidence may be retained only as an explicitly
+  attributed practitioner report, tentative lead, or partially applicable
+  observation. Background evidence may orient the reader but may not answer
+  an unresolved aspect.
+- Synthesis-ready evidence whose applicability is partial, adjacent, or
+  context-only must retain that applicability label. Do not transfer a
+  numeric setting or workflow from its supported scope to another model,
+  version, population, region, or operating mode.
 - State unresolved scope as an explicit evidence limitation.
 - Do not call fallback sources primary.
 - Do not generalize beyond matched scope anchors.
 - Preserve the relationship and category asked by the user. Keep adjacent
   causes, effects, risks, mitigations, and correlations separate unless
   judge-approved evidence explicitly supports the classification.
+- Keep each supported claim attached to its supported_entities. Attribute a
+  feature, workflow, or setting only to the tool, interface, product, version,
+  or method named by that claim. Transfer between subjects only when a direct
+  evidence claim names that relationship.
 - Put an inline Markdown citation at the end of every substantive evidence
   paragraph, using only exact URLs from the allowlist.
 - Return only the corrected Markdown report.
@@ -558,6 +895,7 @@ async def generate_report(
     prompt_family: type[PromptFamily] | PromptFamily = PromptFamily,
     available_images: list = None,
     verified_source_urls: list[str] | None = None,
+    supplemental_source_urls: list[str] | None = None,
     coverage_ledger: list[dict[str, Any]] | None = None,
     **kwargs
 ):
@@ -588,6 +926,11 @@ async def generate_report(
         for url in (verified_source_urls or [])
         if str(url).strip()
     ]
+    supplemental_source_urls = [
+        str(url).strip()
+        for url in (supplemental_source_urls or [])
+        if str(url).strip() and str(url).strip() not in verified_source_urls
+    ]
     coverage_ledger = coverage_ledger or []
     generate_prompt = get_prompt_by_report_type(report_type, prompt_family)
     report = ""
@@ -606,10 +949,29 @@ VERIFIED CITATION URL ALLOWLIST:
 {verified_source_urls}
 
 Citation safety requirements:
-- Cite only the exact URLs in this allowlist.
+- For synthesis-ready factual claims, cite only the exact URLs in this
+  verified allowlist.
 - URLs appearing inside source-page content are not verified sources and must
-  not be cited unless they also appear in the allowlist.
+  not be cited unless they also appear in one of the explicit allowlists.
 - Do not invent, expand, shorten, or substitute citation URLs.
+"""
+    if supplemental_source_urls:
+        content += f"""
+
+LABELED SUPPLEMENTAL EVIDENCE URL ALLOWLIST:
+{supplemental_source_urls}
+
+Supplemental-evidence requirements:
+- These pages passed content integrity but are not synthesis-ready facts.
+- Use only the exact supported_claims recorded for them in the coverage
+  ledger. Do not infer additional facts from their titles or URLs.
+- Every use must be explicitly attributed and labeled as practitioner,
+  provisional, tentative, background, adjacent, or partially applicable,
+  matching the ledger's claim_status, evidence_strength, confidence_label,
+  and applicability.
+- Supplemental evidence cannot resolve an aspect, erase a missing scope
+  anchor, support a broad conclusion, or be presented as established fact.
+- Cite the exact supplemental URL in the same paragraph.
 """
     if coverage_ledger:
         content += f"""
@@ -618,7 +980,15 @@ AUTHORITATIVE COVERAGE LEDGER:
 {json.dumps(coverage_ledger, ensure_ascii=False)}
 
 Evidence-safety requirements:
-- Use factual content only for aspects whose state is evidence_ready.
+- State unqualified factual content only from synthesis-ready evidence in
+  aspects whose state is evidence_ready.
+- Provisional evidence may appear only as a clearly attributed and labeled
+  observation. Background evidence may explain context but may not answer an
+  unresolved aspect.
+- Label synthesis-ready evidence as partially applicable or adjacent whenever
+  the ledger does. State its supported scope and do not transfer numeric
+  settings or workflows to an unmentioned model, version, population, region,
+  or operating mode.
 - State unresolved aspects and missing scope anchors as evidence limitations.
 - Never call fallback evidence primary evidence.
 - Do not generalize beyond matched_scope_anchors.
@@ -626,6 +996,10 @@ Evidence-safety requirements:
 - Preserve the relationship and category asked by the user. Keep adjacent
   causes, effects, risks, mitigations, and correlations separate unless
   judge-approved evidence explicitly supports the classification.
+- Keep each supported claim attached to its supported_entities. Attribute a
+  feature, workflow, or setting only to the tool, interface, product, version,
+  or method named by that claim. Transfer between subjects only when a direct
+  evidence claim names that relationship.
 - Every substantive evidence paragraph must end with an inline citation.
 """
     

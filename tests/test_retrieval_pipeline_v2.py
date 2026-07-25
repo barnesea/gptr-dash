@@ -7,6 +7,7 @@ from gpt_researcher.actions.retrieval_pipeline import (
     EvidenceCandidateLedger,
     canonicalize_url,
     evidence_role,
+    label_evidence_judgment,
     lexical_collision,
     missing_evidence_roles,
     normalize_aspect_contract,
@@ -60,6 +61,20 @@ def test_compact_query_is_entity_first_and_bounded():
     assert len(normalized_tokens(query)) <= 12
 
 
+def test_compact_query_preserves_a_valid_short_planner_query():
+    aspect = krea_aspect()
+    aspect["search_query"] = (
+        "Krea 2 Ostris AI Toolkit style LoRA dataset captioning"
+    )
+
+    query = render_compact_query(
+        aspect,
+        evidence_role="practitioner",
+    )
+
+    assert query == aspect["search_query"]
+
+
 def test_topic_anchors_are_not_promoted_to_exact_entities():
     aspect = normalize_aspect_contract(
         {
@@ -71,6 +86,48 @@ def test_topic_anchors_are_not_promoted_to_exact_entities():
     )
 
     assert aspect["entities"] == []
+
+
+def test_evidence_labels_separate_synthesis_provisional_and_context():
+    strong = label_evidence_judgment(
+        {
+            "confidence": 0.9,
+            "evidence_application": "direct",
+            "applicability": "exact",
+        },
+        resolved_role="first_party",
+        synthesis_eligible=True,
+    )
+    provisional = label_evidence_judgment(
+        {
+            "confidence": 0.65,
+            "evidence_application": "direct",
+            "applicability": "adjacent",
+        },
+        resolved_role="practitioner",
+        synthesis_eligible=False,
+    )
+    background = label_evidence_judgment(
+        {
+            "confidence": 0.4,
+            "evidence_application": "background",
+            "applicability": "context",
+        },
+        resolved_role="reputable_secondary",
+        synthesis_eligible=False,
+    )
+
+    assert strong == {
+        "claim_status": "synthesis_ready",
+        "evidence_strength": "strong",
+        "confidence_label": "high",
+        "applicability": "exact",
+    }
+    assert provisional["claim_status"] == "provisional"
+    assert provisional["evidence_strength"] == "moderate"
+    assert provisional["applicability"] == "adjacent"
+    assert background["claim_status"] == "background"
+    assert background["evidence_strength"] == "context_only"
 
 
 def test_entity_guard_detects_generic_verb_collision():
@@ -243,6 +300,45 @@ def test_candidate_ledger_fuses_discoveries_and_excludes_failed_sources():
     ) == []
 
 
+def test_candidate_ledger_records_confidence_relabel_history():
+    ledger = EvidenceCandidateLedger()
+    url = "https://practitioner.example.test/field-note"
+    ledger.register(
+        [{"url": url, "title": "Field note"}],
+        stage="initial",
+        query="field evidence",
+    )
+    ledger.record_judgment(
+        url,
+        {
+            "aspect_id": "workflow",
+            "claim_status": "provisional",
+            "evidence_strength": "tentative",
+            "confidence": 0.4,
+            "confidence_label": "low",
+            "applicability": "partial",
+            "evidence_application": "direct",
+        },
+    )
+    ledger.record_judgment(
+        url,
+        {
+            "aspect_id": "workflow",
+            "claim_status": "synthesis_ready",
+            "evidence_strength": "moderate",
+            "confidence": 0.75,
+            "confidence_label": "high",
+            "applicability": "exact",
+            "evidence_application": "direct",
+        },
+    )
+
+    judgments = ledger.snapshot()["candidates"][0]["judgments"]
+    assert [item["revision"] for item in judgments] == [1, 2]
+    assert judgments[1]["previous_label"]["claim_status"] == "provisional"
+    assert "new evidence judgment" in judgments[1]["relabel_reason"]
+
+
 def test_canonicalization_and_keyless_resolvers_are_bounded():
     assert canonicalize_url(
         "https://Example.com/path/?utm_source=x&keep=1#section"
@@ -367,6 +463,88 @@ def make_judge_conductor():
         add_costs=lambda _cost: None,
     )
     return ResearchConductor(researcher)
+
+
+@pytest.mark.asyncio
+async def test_deep_branch_retains_labeled_background_outside_synthesis():
+    conductor = make_judge_conductor()
+    conductor.researcher.research_mode = "deep_branch"
+    conductor._evidence_judge_excerpts = AsyncMock(
+        return_value={0: ["tool definition"]}
+    )
+    source = {
+        "url": "https://github.com/ostris/ai-toolkit",
+        "title": "Ostris AI Toolkit",
+        "raw_content": "Ostris AI Toolkit is a diffusion training suite.",
+        "_gptr_evidence_role": "first_party",
+    }
+    response = """{"sources":[{
+      "id":1,"supports_aspect":false,"confidence":0.0,
+      "evidence_role":"first_party","evidence_application":"background",
+      "supported_entities":["Ostris AI Toolkit"],
+      "supported_scope":[],
+      "supported_claims":["Ostris AI Toolkit is a diffusion training suite."],
+      "corroborated_by":[],
+      "reason":"Defines the tool but does not establish the Krea 2 workflow."
+    }]}"""
+
+    with patch(
+        "gpt_researcher.skills.researcher.create_chat_completion",
+        new=AsyncMock(return_value=response),
+    ):
+        accepted = await conductor._judge_evidence_sources(
+            "Krea 2 Ostris AI Toolkit style LoRA training",
+            [source],
+        )
+
+    judgment = source["_gptr_evidence_judgment"]
+    assert accepted == [source]
+    assert judgment["retained_in_evidence_pool"] is True
+    assert judgment["accepted_for_synthesis"] is False
+
+
+@pytest.mark.asyncio
+async def test_labeled_pool_retains_uncorroborated_practitioner_as_provisional():
+    conductor = make_judge_conductor()
+    conductor.researcher.cfg.labeled_evidence_pool_enabled = True
+    conductor.researcher.cfg.labeled_evidence_min_confidence = 0.20
+    conductor._evidence_judge_excerpts = AsyncMock(
+        return_value={0: ["hands-on observation"]}
+    )
+    source = {
+        "url": "https://practitioner.example.test/field-note",
+        "title": "Hands-on field note",
+        "raw_content": "A practitioner reports a repeatable workflow.",
+        "_gptr_evidence_role": "practitioner",
+    }
+    response = """{"sources":[{
+      "id":1,"supports_aspect":true,"confidence":0.6,
+      "evidence_role":"practitioner","evidence_application":"direct",
+      "applicability":"partial",
+      "supported_entities":["Named system"],
+      "supported_scope":["one deployment mode"],
+      "supported_claims":["A practitioner reports a repeatable workflow for
+      one deployment mode of the named system."],
+      "corroborated_by":[],
+      "reason":"Relevant hands-on evidence without independent corroboration."
+    }]}"""
+
+    with patch(
+        "gpt_researcher.skills.researcher.create_chat_completion",
+        new=AsyncMock(return_value=response),
+    ):
+        accepted = await conductor._judge_evidence_sources(
+            "named system deployment workflow",
+            [source],
+        )
+
+    judgment = source["_gptr_evidence_judgment"]
+    assert accepted == [source]
+    assert judgment["accepted_for_synthesis"] is False
+    assert judgment["retained_in_evidence_pool"] is True
+    assert judgment["claim_status"] == "provisional"
+    assert judgment["confidence_label"] == "medium"
+    assert judgment["applicability"] == "partial"
 
 
 @pytest.mark.asyncio

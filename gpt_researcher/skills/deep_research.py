@@ -25,12 +25,14 @@ from ..actions.source_selection import (
 from ..actions.retrieval_pipeline import (
     EvidenceCandidateLedger,
     RETRIEVAL_PIPELINE_VERSION,
+    canonicalize_url,
     evidence_role,
     missing_evidence_roles,
     normalize_aspect_contract,
     render_compact_query,
 )
 from ..utils.logging_config import get_json_handler
+from ..utils.subject_grounding import subject_grounding_context
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,30 @@ RECENCY_MONTHS_PATTERN = re.compile(
     r"\b(?:last|past|previous)\s+(\d{1,2})\s+months?\b",
     re.IGNORECASE,
 )
+LITERAL_SUBJECT_PATTERN = re.compile(
+    r"\b(?:[A-Z][A-Za-z0-9+_.-]*|[A-Za-z]+[0-9][A-Za-z0-9+_.-]*)"
+    r"(?:\s+(?:[A-Z0-9][A-Za-z0-9+_.-]*)){0,3}\b"
+)
+SOURCE_CONTEXT_BLOCK_PATTERN = re.compile(
+    r"(?ms)^Source:\s*(?P<url>\S+).*?(?=^Source:\s|\Z)"
+)
+GENERIC_LITERAL_SUBJECTS = {
+    "assistant",
+    "cover",
+    "current",
+    "deep",
+    "evidence",
+    "explain",
+    "how",
+    "i",
+    "make",
+    "or",
+    "please",
+    "research",
+    "use",
+    "user",
+    "what",
+}
 
 
 def _extract_json_payloads(response: str) -> list[str]:
@@ -189,6 +215,173 @@ def _aspect_tokens(value: str) -> set[str]:
         for token in ASPECT_TOKEN_PATTERN.findall(value or "")
         if len(token) >= 4
     }
+
+
+def _normalized_surface(value: str) -> str:
+    """Normalize a literal scope/entity name without erasing version digits."""
+    return " ".join(
+        re.findall(r"[a-z0-9]+", str(value or "").casefold())
+    )
+
+
+def _direct_synthesis_sources(
+    sources: List[dict[str, Any]],
+) -> List[dict[str, Any]]:
+    """Keep collected evidence while exposing only direct evidence to synthesis."""
+    direct: list[dict[str, Any]] = []
+    for source in sources:
+        judgment = source.get("_gptr_evidence_judgment")
+        if not isinstance(judgment, dict):
+            direct.append(source)
+            continue
+        if judgment.get("evidence_application", "direct") != "direct":
+            continue
+        if judgment.get("accepted_for_synthesis") is False:
+            continue
+        if judgment.get("supports_aspect", True):
+            direct.append(source)
+    return direct
+
+
+def _context_for_sources(
+    context: str,
+    allowed_sources: List[dict[str, Any]],
+    all_sources: List[dict[str, Any]],
+) -> str:
+    """Retain only formatted context blocks belonging to allowed evidence."""
+    value = str(context or "")
+    if not value.strip() or not allowed_sources:
+        return ""
+    allowed_urls = {
+        canonicalize_url(source_url(source))
+        for source in allowed_sources
+        if source_url(source)
+    }
+    all_urls = {
+        canonicalize_url(source_url(source))
+        for source in all_sources
+        if source_url(source)
+    }
+    if allowed_urls == all_urls:
+        return value
+
+    blocks = []
+    for match in SOURCE_CONTEXT_BLOCK_PATTERN.finditer(value):
+        if canonicalize_url(match.group("url")) in allowed_urls:
+            blocks.append(match.group(0).strip())
+    return "\n".join(blocks)
+
+
+def _fallback_subject_grounding_plan(
+    query: str,
+    max_subjects: int,
+) -> list[dict[str, Any]]:
+    """Extract literal named subjects when the small JSON plan is invalid."""
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for match in LITERAL_SUBJECT_PATTERN.finditer(query or ""):
+        name = " ".join(match.group(0).split()).strip(" ,:;?.")
+        base_normalized = _normalized_surface(name)
+        if (
+            not base_normalized
+            or base_normalized in GENERIC_LITERAL_SUBJECTS
+            or all(
+                token in GENERIC_LITERAL_SUBJECTS
+                for token in base_normalized.split()
+            )
+        ):
+            continue
+        prefix_tokens = re.findall(
+            r"[a-z][a-z0-9-]*",
+            str(query or "")[:match.start()],
+        )
+        modifiers: list[str] = []
+        for token in reversed(prefix_tokens[-2:]):
+            if token in GENERIC_LITERAL_SUBJECTS or token in {
+                "a",
+                "an",
+                "and",
+                "for",
+                "in",
+                "of",
+                "on",
+                "the",
+                "to",
+                "using",
+                "with",
+            }:
+                break
+            modifiers.append(token)
+        if modifiers:
+            name = " ".join([*reversed(modifiers), name])
+        normalized = _normalized_surface(name)
+        if (
+            not normalized
+            or normalized in seen
+        ):
+            continue
+        seen.add(normalized)
+        candidates.append((match.start(), name))
+
+    if not candidates:
+        subject = _research_subject_query(query)
+        return [
+            {
+                "id": "subject-1",
+                "name": subject,
+                "role": "main",
+                "definition_question": f"What is {subject}?",
+                "search_query": subject,
+                "depends_on": [],
+            }
+        ]
+
+    using_match = re.search(r"\busing\b", query or "", re.IGNORECASE)
+    target_window = query[: using_match.start()] if using_match else query
+    relation_match = list(
+        re.finditer(r"\b(?:for|on|with)\b", target_window, re.IGNORECASE)
+    )
+    focal_index = 0
+    if relation_match:
+        last_relation = relation_match[-1].end()
+        after_relation = [
+            index
+            for index, (position, _name) in enumerate(candidates)
+            if last_relation <= position < len(target_window)
+        ]
+        if after_relation:
+            focal_index = after_relation[0]
+
+    ordered = [
+        candidates[focal_index],
+        *[
+            candidate
+            for index, candidate in enumerate(candidates)
+            if index != focal_index
+        ],
+    ][: max(1, max_subjects)]
+    main_name = ordered[0][1]
+    subjects = []
+    for index, (_position, name) in enumerate(ordered):
+        dependencies = [] if index == 0 else ["subject-1"]
+        contextual_suffix = (
+            ""
+            if index == 0
+            else f" in the context of {main_name}"
+        )
+        subjects.append(
+            {
+                "id": f"subject-{index + 1}",
+                "name": name,
+                "role": "main" if index == 0 else "supporting",
+                "definition_question": (
+                    f"What is {name}{contextual_suffix}?"
+                ),
+                "search_query": f"what is {name}{contextual_suffix}",
+                "depends_on": dependencies,
+            }
+        )
+    return subjects
 
 
 def _queries_are_anchored(
@@ -295,6 +488,19 @@ def parse_aspect_plan_response(
                         " habitats",
                     )
                 )
+                or scope_tokens(anchor)
+                <= {
+                    "captioning",
+                    "configuration",
+                    "dataset",
+                    "preparation",
+                    "training",
+                    "validation",
+                    "workflow",
+                    "performance",
+                    "quality",
+                    "limitations",
+                }
             ):
                 continue
             anchor_tokens = scope_tokens(anchor)
@@ -333,6 +539,166 @@ def parse_aspect_plan_response(
             break
     aspects.sort(key=lambda item: (item["priority"], item["id"]))
     return aspects[:num_aspects]
+
+
+def parse_subject_grounding_plan_response(
+    response: str,
+    max_subjects: int,
+    original_query: str,
+) -> List[Dict[str, Any]]:
+    """Validate a positive, dependency-ordered subject-definition plan."""
+    parsed = _load_repaired_json(response)
+    candidates = parsed.get("subjects") if isinstance(parsed, dict) else parsed
+    if not isinstance(candidates, list):
+        return []
+
+    subjects: list[dict[str, Any]] = []
+    known_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for index, item in enumerate(candidates):
+        if not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or "").split()).strip(" -,:")
+        question = " ".join(
+            str(
+                item.get("definition_question")
+                or item.get("question")
+                or ""
+            ).split()
+        ).strip()
+        search_query = _clean_planned_search_query(
+            str(item.get("search_query") or item.get("searchQuery") or "")
+        )
+        if not name or not question or not search_query:
+            continue
+        normalized_name = name.casefold()
+        if normalized_name in seen_names:
+            continue
+        if not (_aspect_tokens(name) & _aspect_tokens(search_query)):
+            continue
+
+        raw_id = re.sub(
+            r"[^a-z0-9_-]+",
+            "-",
+            str(item.get("id") or f"subject-{index + 1}").strip().lower(),
+        ).strip("-")
+        subject_id = raw_id or f"subject-{index + 1}"
+        if subject_id in known_ids:
+            subject_id = f"subject-{index + 1}"
+        dependencies = [
+            str(value).strip().lower()
+            for value in item.get("depends_on", [])
+            if str(value).strip().lower() in known_ids
+        ]
+        role = str(item.get("role") or "").strip().lower()
+        if index == 0 or not subjects:
+            role = "main"
+            dependencies = []
+        elif role not in {"main", "supporting"}:
+            role = "supporting"
+
+        subjects.append(
+            {
+                "id": subject_id,
+                "name": name,
+                "role": role,
+                "definition_question": question,
+                "search_query": search_query,
+                "depends_on": list(dict.fromkeys(dependencies)),
+            }
+        )
+        known_ids.add(subject_id)
+        seen_names.add(normalized_name)
+        if len(subjects) >= max(1, max_subjects):
+            break
+
+    if not subjects:
+        return []
+    main_tokens = _aspect_tokens(subjects[0]["name"])
+    if not (main_tokens & _aspect_tokens(original_query)):
+        return []
+    return subjects
+
+
+def parse_subject_grounding_response(response: str) -> Dict[str, Any]:
+    """Extract the bounded grounding paragraph and its structured subject map."""
+    parsed = _load_repaired_json(response)
+    if not isinstance(parsed, dict):
+        return {}
+    statement = " ".join(
+        str(
+            parsed.get("grounding_statement")
+            or parsed.get("groundingStatement")
+            or ""
+        ).split()
+    ).strip()
+    if len(statement.split()) < 12:
+        return {}
+    definitions = []
+    for item in parsed.get("subject_definitions", []):
+        if not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or "").split()).strip()
+        definition = " ".join(
+            str(item.get("definition") or "").split()
+        ).strip()
+        if name and definition:
+            definitions.append(
+                {"name": name[:160], "definition": definition[:600]}
+            )
+    relationship = " ".join(
+        str(parsed.get("relationship") or "").split()
+    ).strip()
+    defining_facts = []
+    allowed_fact_types = {
+        "identity",
+        "variant",
+        "component",
+        "role",
+        "relationship",
+        "terminology",
+        "scope",
+    }
+    allowed_confidence = {"high", "medium", "low"}
+    for item in parsed.get("defining_facts", []):
+        if not isinstance(item, dict):
+            continue
+        subject = " ".join(
+            str(item.get("subject") or "").split()
+        ).strip()
+        fact = " ".join(str(item.get("fact") or "").split()).strip()
+        if not subject or not fact:
+            continue
+        fact_type = str(
+            item.get("fact_type") or "identity"
+        ).strip().lower()
+        if fact_type not in allowed_fact_types:
+            fact_type = "identity"
+        confidence_label = str(
+            item.get("confidence_label") or "medium"
+        ).strip().lower()
+        if confidence_label not in allowed_confidence:
+            confidence_label = "medium"
+        evidence_urls = [
+            str(url).strip()
+            for url in item.get("evidence_urls", [])
+            if str(url).strip().startswith(("http://", "https://"))
+        ][:4]
+        defining_facts.append(
+            {
+                "subject": subject[:160],
+                "fact": fact[:600],
+                "fact_type": fact_type,
+                "confidence_label": confidence_label,
+                "evidence_urls": list(dict.fromkeys(evidence_urls)),
+            }
+        )
+    return {
+        "statement": statement[:1800],
+        "subject_definitions": definitions[:8],
+        "relationship": relationship[:600],
+        "defining_facts": defining_facts[:12],
+    }
 
 
 def parse_research_results_response(response: str, num_learnings: int) -> Dict[str, Any]:
@@ -497,6 +863,20 @@ class DeepResearchSkill:
             branch_mode = "focused"
         self.tree_policy = tree_policy
         self.branch_mode = branch_mode
+        deepening_strategy = str(
+            getattr(
+                researcher.cfg,
+                "deep_research_deepening_strategy",
+                "strongest",
+            )
+        ).strip().lower()
+        if deepening_strategy not in {"strongest", "gap_first"}:
+            logger.warning(
+                "Unknown DEEP_RESEARCH_DEEPENING_STRATEGY=%r; using gap_first",
+                deepening_strategy,
+            )
+            deepening_strategy = "gap_first"
+        self.deepening_strategy = deepening_strategy
         # One tree-wide budget prevents child subtrees from multiplying the
         # configured concurrency limit when they are run in parallel.
         self._branch_semaphore = asyncio.Semaphore(max(1, self.concurrency_limit))
@@ -519,6 +899,9 @@ class DeepResearchSkill:
         )
         self.researcher.candidate_ledger = self.candidate_ledger
         self.preliminary_candidates: list[dict[str, Any]] = []
+        self.subject_grounding: dict[str, Any] = dict(
+            getattr(researcher, "subject_grounding", {}) or {}
+        )
 
     def _emit_event(
         self,
@@ -550,6 +933,16 @@ class DeepResearchSkill:
     def _eligible_for_deepening(
         self, result: Dict[str, Any], metrics: Dict[str, Any]
     ) -> bool:
+        if (
+            self.deepening_strategy == "gap_first"
+            and result.get("coverage_state") != "evidence_ready"
+        ):
+            aspect = result.get("aspect") or {}
+            return bool(
+                aspect.get("question")
+                or aspect.get("search_query")
+                or result.get("query")
+            )
         minimum_score = max(
             0,
             int(
@@ -566,6 +959,65 @@ class DeepResearchSkill:
             and metrics["query_anchored_sources"] > 0
             and metrics["context_chars"] > 0
             and bool(result.get("context"))
+        )
+
+    def _deepening_selection_score(
+        self,
+        result: Dict[str, Any],
+        evidence_score: int,
+    ) -> tuple[int, str]:
+        """Prioritize important missing coverage before optional extra detail."""
+        state = str(result.get("coverage_state") or "no_candidates")
+        if self.deepening_strategy != "gap_first":
+            return evidence_score, "strongest evidence-backed branch"
+        if state == "evidence_ready":
+            return evidence_score, "additional detail after coverage repair"
+        gap_weights = {
+            "scope_missing": 90,
+            "corroboration_missing": 80,
+            "compression_empty": 70,
+            "no_qualified_source": 60,
+            "scrape_failure": 50,
+            "integrity_failure": 45,
+            "no_candidates": 40,
+        }
+        priority = max(
+            1,
+            int((result.get("aspect") or {}).get("priority") or 999),
+        )
+        missing_scope = len(result.get("missing_scope_anchors") or [])
+        gap_score = (
+            1000
+            + gap_weights.get(state, 30)
+            + max(0, 30 - min(priority, 30))
+            + min(missing_scope, 6) * 8
+            + min(evidence_score, 20)
+        )
+        return gap_score, f"highest-priority unresolved {state} gap"
+
+    @staticmethod
+    def _deepening_prompt(result: Dict[str, Any]) -> str:
+        """Describe either a precise coverage gap or an evidence-led follow-up."""
+        state = str(result.get("coverage_state") or "no_candidates")
+        aspect = result.get("aspect") or {}
+        if state != "evidence_ready":
+            return (
+                "Fill this unresolved research coverage gap without broadening "
+                "the subject.\n"
+                f"Aspect: {json.dumps(aspect, ensure_ascii=False)}\n"
+                f"Failure state: {state}\n"
+                "Missing scope anchors: "
+                f"{json.dumps(result.get('missing_scope_anchors') or [])}\n"
+                "Previously attempted query: "
+                f"{result.get('query') or aspect.get('search_query') or ''}\n"
+                "Generate focused searches for the missing relationship or "
+                "scope, using different wording or a more appropriate evidence "
+                "source type."
+            )
+        return (
+            f"Previous research goal: {result.get('researchGoal') or ''}\n"
+            "Follow-up questions: "
+            + " ".join(result.get("followUpQuestions") or [])
         )
 
     @staticmethod
@@ -595,9 +1047,10 @@ class DeepResearchSkill:
         seen_source_urls: set[str] = set()
         for source in sources:
             url = source_url(source)
-            if not url or url in seen_source_urls:
+            identity = canonicalize_url(url)
+            if not identity or identity in seen_source_urls:
                 continue
-            seen_source_urls.add(url)
+            seen_source_urls.add(identity)
             deduplicated_sources.append(source)
         return {
             "learnings": list(dict.fromkeys(merged_learnings)),
@@ -787,12 +1240,698 @@ Return ONLY a JSON object using this exact schema:
             )
         return plan
 
+    async def _plan_subject_grounding(
+        self,
+        query: str,
+        initial_results: list[dict[str, Any]],
+        max_subjects: int,
+    ) -> list[dict[str, Any]]:
+        """Identify the small set of concepts that need positive definitions."""
+        started_at = time.perf_counter()
+        prompt = f"""Plan a short subject-grounding search.
+
+User question: {query}
+Initial result cards from a search for the main subject:
+{json.dumps(initial_results, ensure_ascii=False)}
+
+Identify the focal subject and only the supporting concepts whose meaning is
+needed to understand the question. The focal subject is the thing whose
+behavior, properties, outcome, or adaptation the user ultimately wants to
+understand. A tool used to act on that thing is a supporting subject. Return no
+more than {max_subjects} subjects in dependency order.
+
+Return JSON only:
+{{"subjects":[{{"id":"subject-1","name":"literal subject name","role":"main|supporting","definition_question":"a plain-English question asking what this subject is in this setting","search_query":"a short natural-language definition query","depends_on":[]}}]}}
+
+Rules:
+- Describe what each subject is; do not answer the user's larger research task.
+- Use positive definitions of identities, terminology, and relationships.
+- Do not propose excluded topics, negative keywords, or relevance rules.
+- For the focal subject, make the definition question and search query seek an
+  authoritative overview of its named variants, components, roles, or modes
+  when those distinctions are part of understanding what the subject is.
+- For a supporting subject, seek its precise role in the focal subject's
+  context rather than a generic dictionary definition.
+- Keep meaningful modifiers as part of a subject name. A request about a
+  "style adapter" needs that full compound concept defined, not only the
+  generic word "adapter".
+- A subject name must be a noun or named entity, never the full user question
+  or an instruction such as "cover" or "research".
+- The first item is the focal subject and has no dependencies.
+- When a process creates an artifact for, or adapts, a named system, the named
+  system whose behavior or output changes is the focal subject. The artifact,
+  method, and tool are supporting subjects.
+- A supporting subject may depend on the main subject when its meaning changes
+  by domain. Its search query should name that context in plain English.
+- Use only literal subjects from the question or clearly supported by the
+  initial cards. Do not invent product aliases, versions, or relationships.
+- Keep the plan small. Return JSON only."""
+        subjects: list[dict[str, Any]] = []
+        error = ""
+        response = ""
+        fallback_used = False
+        try:
+            response = await create_chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You map the subjects in a research question. "
+                            "Use plain English and return valid JSON only."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                llm_provider=self.researcher.cfg.fast_llm_provider,
+                model=self.researcher.cfg.fast_llm_model,
+                temperature=0.1,
+                max_tokens=2400,
+                llm_kwargs=self.researcher.cfg.llm_kwargs,
+                cost_callback=getattr(self.researcher, "add_costs", None),
+            )
+            subjects = parse_subject_grounding_plan_response(
+                response,
+                max_subjects,
+                query,
+            )
+        except Exception as exc:
+            error = str(exc)
+            logger.warning("Subject-grounding plan failed: %s", exc)
+        if not subjects:
+            fallback_used = True
+            subjects = _fallback_subject_grounding_plan(
+                query,
+                max_subjects,
+            )
+        self._emit_event(
+            "subject_grounding_plan",
+            {
+                "duration_seconds": round(
+                    time.perf_counter() - started_at, 3
+                ),
+                "subjects": subjects,
+                "fallback_used": fallback_used,
+                "fallback_reason": (
+                    error
+                    or (
+                        "invalid structured subject plan"
+                        if fallback_used
+                        else ""
+                    )
+                ),
+                "invalid_response_excerpt": (
+                    response[:500] if fallback_used else ""
+                ),
+                "error": error,
+            },
+        )
+        return subjects
+
+    @staticmethod
+    def _contextual_grounding_query(
+        subject: dict[str, Any],
+        subjects_by_id: dict[str, dict[str, Any]],
+    ) -> str:
+        """Ensure a dependent definition query names its positive context."""
+        query = str(subject.get("search_query") or "").strip()
+        dependencies = [
+            subjects_by_id[subject_id]
+            for subject_id in subject.get("depends_on", [])
+            if subject_id in subjects_by_id
+        ]
+        dependency_names = [
+            str(item.get("name") or "").strip()
+            for item in dependencies
+            if str(item.get("name") or "").strip()
+        ]
+        query_tokens = _aspect_tokens(query)
+        missing_names = [
+            name
+            for name in dependency_names
+            if not (_aspect_tokens(name) & query_tokens)
+        ]
+        if missing_names:
+            query = (
+                f"{query} in the context of "
+                + " and ".join(missing_names)
+            )
+        return _clean_planned_search_query(query)
+
+    async def _collect_subject_grounding_cards(
+        self,
+        subjects: list[dict[str, Any]],
+        initial_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Reuse main-subject cards and fetch dependent definitions in parallel."""
+        max_results = max(
+            1,
+            int(
+                getattr(
+                    self.researcher.cfg,
+                    "subject_grounding_results_per_query",
+                    4,
+                )
+            ),
+        )
+        concurrency = max(
+            1,
+            min(
+                6,
+                int(
+                    getattr(
+                        self.researcher.cfg,
+                        "subject_grounding_search_concurrency",
+                        4,
+                    )
+                ),
+            ),
+        )
+        subjects_by_id = {
+            str(subject["id"]): subject for subject in subjects
+        }
+        cards: list[dict[str, Any]] = []
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def search_subject(
+            subject: dict[str, Any],
+        ) -> tuple[dict[str, Any], str, list[dict[str, Any]], float]:
+            search_query = self._contextual_grounding_query(
+                subject,
+                subjects_by_id,
+            )
+            started_at = time.perf_counter()
+
+            async def search_retriever(retriever):
+                async with semaphore:
+                    try:
+                        return await get_search_results(
+                            search_query,
+                            retriever,
+                            researcher=self.researcher,
+                            max_results=max_results,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Subject-grounding search failed for %r: %s",
+                            search_query,
+                            exc,
+                        )
+                        return []
+
+            result_sets = await asyncio.gather(
+                *[
+                    search_retriever(retriever)
+                    for retriever in self.researcher.retrievers
+                ]
+            )
+            return (
+                subject,
+                search_query,
+                [item for values in result_sets for item in values],
+                time.perf_counter() - started_at,
+            )
+
+        # The original preliminary SERP is the first grounding wave and informs
+        # this plan. Its definition queries are therefore independent and can
+        # form a parallel second wave.
+        searches = await asyncio.gather(
+            *[search_subject(subject) for subject in subjects]
+        )
+        search_events = []
+        seen_subject_urls = {
+            (str(card.get("subject_id") or ""), str(card.get("url") or ""))
+            for card in cards
+            if card.get("url")
+        }
+        for subject, search_query, results, duration in searches:
+            subject_cards = []
+            for result in results:
+                url = source_url(result)
+                subject_url = (str(subject["id"]), url)
+                if not url or subject_url in seen_subject_urls:
+                    continue
+                if (
+                    source_quality_tier(result, search_query) == "reject"
+                    or not has_meaningful_query_anchor(
+                        search_query,
+                        result,
+                    )
+                ):
+                    continue
+                seen_subject_urls.add(subject_url)
+                subject_cards.append(
+                    {
+                        "title": str(result.get("title") or "")[:240],
+                        "url": url,
+                        "snippet": str(
+                            result.get("body")
+                            or result.get("snippet")
+                            or ""
+                        )[:700],
+                        "engine": str(result.get("engine") or "")[:80],
+                        "date": str(result.get("date") or "")[:80],
+                        "subject_id": subject["id"],
+                        "subject_name": subject["name"],
+                        "definition_question": subject[
+                            "definition_question"
+                        ],
+                        "search_query": search_query,
+                    }
+                )
+                if len(subject_cards) >= max_results:
+                    break
+            cards.extend(subject_cards)
+            search_events.append(
+                {
+                    "subject_id": subject["id"],
+                    "subject_name": subject["name"],
+                    "query": search_query,
+                    "duration_seconds": round(duration, 3),
+                    "result_count": len(subject_cards),
+                    "urls": [card["url"] for card in subject_cards],
+                }
+            )
+        if subjects and not any(
+            card.get("subject_id") == subjects[0]["id"]
+            for card in cards
+        ):
+            cards.extend(
+                {
+                    **result,
+                    "subject_id": subjects[0]["id"],
+                    "subject_name": subjects[0]["name"],
+                    "definition_question": subjects[0][
+                        "definition_question"
+                    ],
+                    "search_query": subjects[0]["search_query"],
+                }
+                for result in initial_results[:max_results]
+            )
+        self._emit_event(
+            "subject_grounding_search",
+            {
+                "searches": search_events,
+                "result_count": len(cards),
+                "search_concurrency": concurrency,
+            },
+        )
+        return cards
+
+    async def _plan_grounded_aspects(
+        self,
+        query: str,
+        num_aspects: int,
+        subjects: list[dict[str, Any]],
+        initial_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Plan coverage while definition searches run on another I/O path."""
+        current_datetime = datetime.now()
+        prompt = f"""Create a concise coverage plan for web research.
+
+Original question: {query}
+Current date: {current_datetime:%Y-%m-%d}
+Requested recency window: {_requested_recency_window(query, current_datetime)}
+Subject map: {json.dumps(subjects, ensure_ascii=False)}
+Initial result cards: {json.dumps(initial_results, ensure_ascii=False)}
+
+Return exactly {num_aspects} aspects as JSON:
+{{"aspects":[{{"id":"aspect-1","priority":1,"intent":"broad|entity|procedural|comparison|recent|mixed","question":"standalone question","search_query":"short natural-language query","entities":[{{"name":"literal entity or version","aliases":[],"exact":true}}],"relation":"specific relationship this aspect must establish","evidence_roles":["first_party|original|reputable_secondary|practitioner"],"expected_evidence_type":"specific evidence needed","original_query_anchors":["literal anchor"],"required_scope_anchors":[]}}]}}
+
+Rules:
+- Each aspect covers a different required part of the question.
+- Keep every search query short, standalone, and centered on the focal subject.
+- Preserve literal names, versions, dates, and URLs. Use only aliases supported
+  by the initial cards.
+- Preserve meaningful modifiers in the user's wording. A requested artifact
+  type, outcome, or relationship must not be broadened to its generic family.
+- Definition cards help identify subjects. Do not add a card-specific subtype,
+  feature, training mode, setting, example task, or workflow to the plan unless
+  the original question asks for it.
+- For questions involving several methods, products, taxa, versions, or
+  regions, divide them across entity-specific aspects instead of making every
+  aspect claim all of them.
+- Combine closely related workflow stages when the aspect budget is smaller
+  than the number of requested stages.
+- State the exact relationship each aspect must establish. Loading, inference,
+  training, validation, and editing are distinct relationships.
+- Use evidence roles by function, retaining practitioner evidence for practical
+  work. Use required_scope_anchors for every material applicability qualifier
+  a claim must match, including variants, versions, modes, operations,
+  populations, regions, artifact subtypes, and time windows.
+- Use natural language without search operators or planner meta-language.
+- Return JSON only."""
+        try:
+            response = await create_chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You plan focused evidence collection. Return "
+                            "concise valid JSON only."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                llm_provider=self.researcher.cfg.strategic_llm_provider,
+                model=self.researcher.cfg.strategic_llm_model,
+                reasoning_effort=self.researcher.cfg.reasoning_effort,
+                temperature=0.2,
+                max_tokens=2600,
+                llm_kwargs=self.researcher.cfg.llm_kwargs,
+                cost_callback=getattr(self.researcher, "add_costs", None),
+            )
+            plan = parse_aspect_plan_response(
+                response,
+                num_aspects,
+                query,
+            )
+            return self._finalize_grounded_aspect_plan(
+                plan,
+                subjects,
+            )
+        except Exception as exc:
+            logger.warning("Grounded aspect planning failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _finalize_grounded_aspect_plan(
+        plan: list[dict[str, Any]],
+        subjects: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Bind planned searches and scope labels to the grounded subjects."""
+        focal_name = str(
+            (subjects[0] if subjects else {}).get("name") or ""
+        ).strip()
+        focal_tokens = _aspect_tokens(focal_name)
+        subject_names = {
+            str(subject.get("name") or "").strip().casefold()
+            for subject in subjects
+            if str(subject.get("name") or "").strip()
+        }
+        for aspect in plan:
+            if (
+                focal_name
+                and focal_tokens
+                and not (
+                    focal_tokens
+                    & _aspect_tokens(aspect["search_query"])
+                )
+            ):
+                aspect["search_query"] = (
+                    f"{focal_name} {aspect['search_query']}"
+                )
+            for entity in aspect.get("entities") or []:
+                entity_name = str(
+                    entity.get("name") or ""
+                ).strip().casefold()
+                entity["aliases"] = [
+                    alias
+                    for alias in entity.get("aliases") or []
+                    if str(alias).strip().casefold() not in (
+                        subject_names - {entity_name}
+                    )
+                ]
+            exact_entity_names = [
+                str(entity.get("name") or "").strip()
+                for entity in aspect.get("entities") or []
+                if entity.get("exact", True)
+                and str(entity.get("name") or "").strip()
+            ]
+            if len(exact_entity_names) >= 2:
+                scope_anchors = list(
+                    aspect.get("required_scope_anchors") or []
+                )
+                normalized_scope_anchors = {
+                    _normalized_surface(anchor)
+                    for anchor in scope_anchors
+                    if _normalized_surface(anchor)
+                }
+                for entity_name in exact_entity_names:
+                    normalized_entity = _normalized_surface(entity_name)
+                    if normalized_entity not in normalized_scope_anchors:
+                        scope_anchors.append(entity_name)
+                        normalized_scope_anchors.add(normalized_entity)
+                aspect["required_scope_anchors"] = scope_anchors
+        return plan
+
+    async def _generate_grounded_aspect_plan(
+        self,
+        query: str,
+        num_aspects: int,
+        initial_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Define the subject from quick evidence, then plan deeper research."""
+        max_subjects = max(
+            1,
+            min(
+                6,
+                int(
+                    getattr(
+                        self.researcher.cfg,
+                        "subject_grounding_max_subjects",
+                        4,
+                    )
+                ),
+            ),
+        )
+        subjects = await self._plan_subject_grounding(
+            query,
+            initial_results,
+            max_subjects,
+        )
+        cards = await self._collect_subject_grounding_cards(
+            subjects,
+            initial_results,
+        )
+        self.preliminary_candidates = list(cards)
+        if self.retrieval_pipeline_mode == "v2":
+            self.candidate_ledger.register(
+                cards,
+                stage="subject_grounding",
+                query=query,
+            )
+        prompt = f"""Create a positive subject grounding for web research.
+
+Original question: {query}
+Definition questions:
+{json.dumps(subjects, ensure_ascii=False)}
+Search result cards for those definition questions:
+{json.dumps(cards, ensure_ascii=False)}
+
+Write one plain-English grounding paragraph of roughly 70 to 140 words.
+It should clearly define the main subject, the supporting terms, and how they
+relate in this question. Use the original wording and the result cards. Keep
+uncertain relationships framed as the relationship the research must establish.
+The paragraph is for interpreting later evidence, not for answering the full
+question.
+
+Then use that grounding to create exactly {num_aspects} distinct research
+aspects. The aspects start the deeper searches, so their questions and search
+queries must stay inside the subject and relationship defined by the paragraph.
+
+Return JSON only:
+{{"grounding_statement":"one paragraph","subject_definitions":[{{"name":"literal subject","definition":"short positive definition"}}],"defining_facts":[{{"subject":"literal subject or variant","fact":"short positive identity, variant, component, role, terminology, scope, or relationship fact","fact_type":"identity|variant|component|role|relationship|terminology|scope","confidence_label":"high|medium|low","evidence_urls":["exact result-card URL"]}}],"relationship":"the relationship the research must establish","aspects":[{{"id":"aspect-1","priority":1,"intent":"broad|entity|procedural|comparison|recent|mixed","question":"standalone question","search_query":"short natural-language query","entities":[{{"name":"literal entity or version","aliases":[],"exact":true}}],"relation":"specific relationship this aspect must establish","evidence_roles":["first_party|original|reputable_secondary|practitioner"],"expected_evidence_type":"specific evidence needed","original_query_anchors":["literal anchor"],"required_scope_anchors":[]}}]}}
+
+Requirements:
+- Define identities, terminology, and relationships positively. Do not create
+  excluded-topic lists, negative keywords, or speculative relevance rules.
+- Extract a small set of positive defining_facts when result cards explicitly
+  identify variants, components, intended roles, terminology, or relationships.
+  Each fact must cite one or more exact result-card URLs. Do not infer a fact
+  from a title alone when the snippet does not support it.
+- Preserve meaningful modifiers in the original question as part of the
+  subject definition. Define the requested kind of artifact or outcome, not
+  only its generic technical family.
+- Treat result cards as orientation evidence, not as final factual sources.
+- Use cards only for short identity, category, and purpose definitions. Do not
+  put configuration values, numerical claims, example tasks, dataset recipes,
+  or step-by-step workflows in this paragraph. Those belong to later research.
+- Preserve literal entities, versions, dates, and URLs from the question.
+- Keep similarly named products, versions, methods, and organizations as
+  separate subjects unless a result card directly establishes their identity.
+- Each aspect covers a different required part of the original question.
+- Preserve the exact artifact type, outcome, and relationship in the user's
+  wording. Do not broaden a modified subject to its generic technical family.
+- Put every material applicability qualifier needed to judge a claim into
+  required_scope_anchors. This includes user-requested variants, versions,
+  modes, operations, populations, regions, artifact subtypes, or time windows,
+  not merely the named entities.
+- Definition cards help identify subjects. A card-specific subtype, feature,
+  training mode, setting, example task, or workflow is not new user scope.
+- Keep search queries short, standalone, in natural language, and centered on
+  the focal subject. Use no search operators or planner meta-language.
+- Divide multi-entity coverage into sensible aspects when one source is
+  unlikely to cover every entity. Combine related workflow stages when the
+  aspect budget is smaller than the requested stages.
+- Retain practitioner evidence for practical work.
+- Keep the paragraph compact and factual. Return exactly {num_aspects} aspects.
+- Return JSON only."""
+
+        response = ""
+        error = ""
+        try:
+            response = await create_chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You define research subjects and use that "
+                            "definition to plan evidence collection. Use "
+                            "plain English and return valid JSON only."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                llm_provider=self.researcher.cfg.strategic_llm_provider,
+                model=self.researcher.cfg.strategic_llm_model,
+                reasoning_effort=self.researcher.cfg.reasoning_effort,
+                temperature=0.2,
+                max_tokens=4800,
+                llm_kwargs=self.researcher.cfg.llm_kwargs,
+                cost_callback=getattr(
+                    self.researcher, "add_costs", None
+                ),
+            )
+        except Exception as exc:
+            error = str(exc)
+            logger.warning(
+                "Subject grounding and aspect planning failed: %s",
+                exc,
+            )
+
+        grounding = parse_subject_grounding_response(response)
+        grounding_fallback = not bool(grounding)
+        if grounding_fallback:
+            main_name = str(
+                (subjects[0] if subjects else {}).get("name")
+                or _research_subject_query(query)
+            )
+            supporting_names = [
+                str(subject.get("name") or "")
+                for subject in subjects[1:]
+                if str(subject.get("name") or "").strip()
+            ]
+            supporting_text = (
+                ", ".join(supporting_names)
+                if supporting_names
+                else "the other terms named in the question"
+            )
+            grounding = {
+                "statement": (
+                    f"The main subject named in the question is {main_name}. "
+                    f"The supporting subjects are {supporting_text}. Their "
+                    "identities and purposes must be established from web "
+                    "evidence. The research relationship is the user's stated "
+                    f"request: {query} This paragraph defines the subject and "
+                    "relationship only; it does not assert how they work."
+                ),
+                "subject_definitions": [
+                    {
+                        "name": str(subject.get("name") or ""),
+                        "definition": (
+                            "A named subject whose exact role in the question "
+                            "must be established from evidence."
+                        ),
+                    }
+                    for subject in subjects
+                    if str(subject.get("name") or "").strip()
+                ],
+                "relationship": query,
+                "defining_facts": [],
+            }
+        cards_by_url = {
+            canonicalize_url(str(card.get("url") or "")): str(
+                card.get("url") or ""
+            )
+            for card in cards
+            if str(card.get("url") or "").strip()
+        }
+        grounded_facts = []
+        for fact in grounding.get("defining_facts", []):
+            evidence_urls = [
+                cards_by_url[canonical]
+                for url in fact.get("evidence_urls", [])
+                if (canonical := canonicalize_url(url)) in cards_by_url
+            ]
+            if not evidence_urls:
+                continue
+            grounded_facts.append(
+                {
+                    **fact,
+                    "evidence_urls": list(dict.fromkeys(evidence_urls)),
+                }
+            )
+        grounding["defining_facts"] = grounded_facts
+        grounding.update(
+            {
+                "subjects": subjects,
+                "evidence_urls": list(
+                    dict.fromkeys(
+                        card["url"] for card in cards if card.get("url")
+                    )
+                ),
+                "mode": (
+                    "query_grounded_fallback"
+                    if grounding_fallback
+                    else "evidence_grounded"
+                ),
+            }
+        )
+        self.subject_grounding = grounding
+        self.researcher.subject_grounding = dict(grounding)
+
+        plan = self._finalize_grounded_aspect_plan(
+            parse_aspect_plan_response(
+                response,
+                num_aspects,
+                query,
+            ),
+            subjects,
+        )
+        if not plan:
+            with subject_grounding_context(grounding):
+                plan = await self._plan_grounded_aspects(
+                    query,
+                    num_aspects,
+                    subjects,
+                    cards,
+                )
+
+        self._emit_event(
+            "subject_grounding",
+            {
+                "statement": grounding.get("statement", ""),
+                "subject_definitions": grounding.get(
+                    "subject_definitions", []
+                ),
+                "relationship": grounding.get("relationship", ""),
+                "defining_facts": grounding.get("defining_facts", []),
+                "subjects": subjects,
+                "evidence_urls": grounding.get("evidence_urls", []),
+                "grounding_created": bool(grounding),
+                "fallback_used": grounding_fallback,
+                "error": error,
+            },
+        )
+        return plan
+
     async def generate_aspect_plan(
         self, query: str, num_aspects: int
     ) -> List[Dict[str, Any]]:
         """Use preliminary result cards to construct a validated coverage plan."""
         started_at = time.perf_counter()
-        if num_aspects <= 1 and self.retrieval_pipeline_mode != "v2":
+        grounding_enabled = bool(
+            getattr(
+                self.researcher.cfg,
+                "subject_grounding_enabled",
+                False,
+            )
+        )
+        if (
+            num_aspects <= 1
+            and self.retrieval_pipeline_mode != "v2"
+            and not grounding_enabled
+        ):
             plan = self._fallback_aspect_plan(query, 1)
             self._emit_event(
                 "aspect_plan",
@@ -827,8 +1966,18 @@ Return ONLY a JSON object using this exact schema:
                 )
                 return []
 
-        result_sets = await asyncio.gather(
-            *[search(retriever) for retriever in self.researcher.retrievers]
+        # Subject grounding starts from literal terms in the user question,
+        # then searches those definitions before aspect planning. The legacy
+        # path keeps its original-query preliminary SERP.
+        result_sets = (
+            []
+            if grounding_enabled
+            else await asyncio.gather(
+                *[
+                    search(retriever)
+                    for retriever in self.researcher.retrievers
+                ]
+            )
         )
         preliminary_candidates: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
@@ -871,6 +2020,57 @@ Return ONLY a JSON object using this exact schema:
                 stage="preliminary",
                 query=subject_query,
             )
+        if grounding_enabled:
+            plan = await self._generate_grounded_aspect_plan(
+                query,
+                max(1, num_aspects),
+                initial_results,
+            )
+            planning_evidence = (
+                self.preliminary_candidates or initial_results
+            )
+            fallback = self._fallback_aspect_plan(
+                query,
+                max(1, num_aspects),
+            )
+            seen_queries = {
+                " ".join(item["search_query"].lower().split())
+                for item in plan
+            }
+            for item in fallback:
+                normalized = " ".join(
+                    item["search_query"].lower().split()
+                )
+                if (
+                    normalized not in seen_queries
+                    and len(plan) < max(1, num_aspects)
+                ):
+                    plan.append(item)
+                    seen_queries.add(normalized)
+            plan = plan[: max(1, num_aspects)]
+            self._emit_event(
+                "aspect_plan",
+                {
+                    "planner_mode": (
+                        "subject_grounded"
+                        if self.subject_grounding
+                        else "subject_grounding_fallback"
+                    ),
+                    "pipeline_version": (
+                        RETRIEVAL_PIPELINE_VERSION
+                        if self.retrieval_pipeline_mode == "v2"
+                        else "legacy"
+                    ),
+                    "duration_seconds": round(
+                        time.perf_counter() - started_at, 3
+                    ),
+                    "aspects": plan,
+                    "initial_results": planning_evidence,
+                    "initial_result_count": len(planning_evidence),
+                    "subject_grounding": self.subject_grounding,
+                },
+            )
+            return plan
         if num_aspects <= 1:
             plan = self._fallback_aspect_plan(query, 1)
             self._emit_event(
@@ -1255,6 +2455,9 @@ enough."""
             query = str(result.get("query") or "")
             reused_sources: list[dict[str, Any]] = []
             reused_contexts: list[str] = []
+            recipient_aspect_id = str(
+                (result.get("aspect") or {}).get("id") or ""
+            )
             for donor in donors:
                 primary_sources = [
                     source
@@ -1262,6 +2465,19 @@ enough."""
                     if source_quality_tier(source, query)
                     in {"primary", "reputable"}
                     and has_meaningful_query_anchor(query, source)
+                    and (
+                        not isinstance(
+                            source.get("_gptr_evidence_judgment"),
+                            dict,
+                        )
+                        or str(
+                            source["_gptr_evidence_judgment"].get(
+                                "aspect_id"
+                            )
+                            or ""
+                        )
+                        == recipient_aspect_id
+                    )
                 ]
                 donor_context = str(donor.get("context") or "").strip()
                 if not primary_sources or not has_meaningful_query_anchor(
@@ -1403,7 +2619,9 @@ enough."""
             {"role": "user",
              "content": (
                  f"Given the following research results for the query '{query}', extract key learnings and suggest "
-                 "follow-up questions. For each learning, include a citation to the source URL if available.\n\n"
+                 "follow-up questions. Name the specific subject described by "
+                 "each learning, and include a citation to the source URL if "
+                 "available.\n\n"
                  "Return ONLY a JSON object using this exact schema:\n"
                  '{"learnings": [{"insight": "<insight>", "sourceUrl": "<url or empty string>"}], '
                  '"followUpQuestions": ["<question 1>", "<question 2>"]}\n\n'
@@ -1589,8 +2807,11 @@ enough."""
             for source in sources
             if isinstance(source.get("_gptr_evidence_judgment"), dict)
         ]
-        judge_verified_relation = bool(judge_results) and all(
-            result.get("supports_aspect") and not result.get("fallback")
+        judge_verified_relation = any(
+            result.get("supports_aspect")
+            and result.get("evidence_application", "direct") == "direct"
+            and result.get("accepted_for_synthesis", True)
+            and not result.get("fallback")
             for result in judge_results
         )
         deterministic_relation_required = (
@@ -1600,6 +2821,14 @@ enough."""
             details["required_scope_anchors"]
             and classification_query.strip()
         )
+        if (
+            judge_results
+            and deterministic_relation_required
+            and not judge_verified_relation
+        ):
+            details["relationship_evidence_missing"] = True
+            details["background_evidence_only"] = True
+            return "compression_empty", details
         if (
             not judge_verified_relation
             and deterministic_relation_required
@@ -1620,7 +2849,12 @@ enough."""
         judged_scope = [
             str(value)
             for result in judge_results
-            for value in result.get("supported_scope", [])
+            if result.get("evidence_application", "direct") == "direct"
+            and result.get("accepted_for_synthesis", True)
+            for value in [
+                *result.get("supported_scope", []),
+                *result.get("supported_entities", []),
+            ]
             if str(value).strip()
         ]
         for scope_anchor in details["required_scope_anchors"]:
@@ -1636,17 +2870,26 @@ enough."""
                         for value in entity.get("aliases") or []
                         if str(value).strip()
                     )
-            matched = any(
+            judged_match = any(
+                scope_anchor_matches_text(alias, value)
+                for alias in lexical_aliases
+                for value in judged_scope
+                if str(value).strip()
+            )
+            if not judged_match:
+                judged_match = any(
+                    _normalized_surface(alias)
+                    == _normalized_surface(value)
+                    for alias in lexical_aliases
+                    for value in judged_scope
+                    if _normalized_surface(value)
+                )
+            lexical_match = any(
                 scope_anchor_matches_text(alias, evidence_text)
                 for alias in lexical_aliases
-            ) or any(
-                bool(
-                    set().union(
-                        *(_aspect_tokens(alias) for alias in lexical_aliases)
-                    )
-                    & _aspect_tokens(value)
-                )
-                for value in judged_scope
+            )
+            matched = (
+                judged_match if judge_results else lexical_match
             )
             target = (
                 details["matched_scope_anchors"]
@@ -1707,9 +2950,10 @@ enough."""
             *(replacement.get("attempted_sources") or []),
         ]:
             url = source_url(source)
-            if not url or url in seen_urls:
+            identity = canonicalize_url(url)
+            if not identity or identity in seen_urls:
                 continue
-            seen_urls.add(url)
+            seen_urls.add(identity)
             combined_sources.append(source)
         combined_context = "\n".join(
             value
@@ -1719,6 +2963,23 @@ enough."""
             )
             if value.strip()
         )
+        combined_direct_sources = _direct_synthesis_sources(
+            combined_sources
+        )
+        combined_direct_context = "\n".join(
+            value
+            for value in (
+                str(previous.get("direct_context") or ""),
+                str(replacement.get("direct_context") or ""),
+            )
+            if value.strip()
+        )
+        if not combined_direct_context:
+            combined_direct_context = _context_for_sources(
+                combined_context,
+                combined_direct_sources,
+                combined_sources,
+            )
         previous_diagnostics = previous.get("retrieval_diagnostics") or {}
         replacement_diagnostics = (
             replacement.get("retrieval_diagnostics") or {}
@@ -1734,9 +2995,19 @@ enough."""
             combined_diagnostics[key] = int(
                 previous_diagnostics.get(key) or 0
             ) + int(replacement_diagnostics.get(key) or 0)
+        coverage_context = (
+            combined_direct_context
+            if combined_direct_sources
+            else combined_context
+        )
+        coverage_sources = (
+            combined_direct_sources
+            if combined_direct_sources
+            else combined_sources
+        )
         state, details = self._coverage_state(
-            combined_context,
-            combined_sources,
+            coverage_context,
+            coverage_sources,
             combined_diagnostics,
             aspect=replacement.get("aspect") or previous.get("aspect"),
         )
@@ -1744,14 +3015,15 @@ enough."""
             {
                 "attempted_context": combined_context,
                 "attempted_sources": combined_sources,
+                "direct_context": combined_direct_context,
                 "retrieval_diagnostics": combined_diagnostics,
                 "coverage_state": state,
                 **details,
             }
         )
         if state == "evidence_ready":
-            replacement["context"] = combined_context
-            replacement["sources"] = combined_sources
+            replacement["context"] = combined_direct_context
+            replacement["sources"] = combined_direct_sources
         else:
             replacement["context"] = ""
             replacement["sources"] = []
@@ -1768,6 +3040,14 @@ enough."""
         missing_scope = list(result.get("missing_scope_anchors") or [])
         attempted_context = str(result.get("attempted_context") or "")
         attempted_sources = list(result.get("attempted_sources") or [])
+        direct_sources = _direct_synthesis_sources(attempted_sources)
+        direct_context = str(result.get("direct_context") or "")
+        if not direct_context:
+            direct_context = _context_for_sources(
+                attempted_context,
+                direct_sources,
+                attempted_sources,
+            )
         if not matched_scope or not missing_scope:
             return None
 
@@ -1783,8 +3063,8 @@ enough."""
             "required_scope_anchors": matched_scope,
         }
         state, details = self._coverage_state(
-            attempted_context,
-            attempted_sources,
+            direct_context,
+            direct_sources,
             result.get("retrieval_diagnostics") or {},
             aspect=partial_aspect,
         )
@@ -1793,8 +3073,9 @@ enough."""
         return {
             **result,
             "aspect": partial_aspect,
-            "context": attempted_context,
-            "sources": attempted_sources,
+            "context": direct_context,
+            "sources": direct_sources,
+            "direct_context": direct_context,
             "coverage_state": state,
             "partial_scope": True,
             "parent_aspect_id": parent_id,
@@ -1811,6 +3092,134 @@ enough."""
         repair_count: int = 0,
     ) -> Dict[str, Any]:
         diagnostics = result.get("retrieval_diagnostics") or {}
+        coverage_state = result.get("coverage_state", "no_candidates")
+        synthesis_sources = (
+            list(result.get("sources") or [])
+            if coverage_state == "evidence_ready"
+            else []
+        )
+        synthesis_source_keys = {
+            canonicalize_url(source_url(source))
+            for source in synthesis_sources
+            if source_url(source)
+        }
+        evidence_pool_sources = [
+            source
+            for source in result.get("attempted_sources") or []
+            if isinstance(
+                source.get("_gptr_evidence_judgment"),
+                dict,
+            )
+            and source["_gptr_evidence_judgment"].get(
+                "retained_in_evidence_pool",
+                True,
+            )
+        ]
+
+        def source_label(source: dict[str, Any]) -> dict[str, Any]:
+            judgment = source.get("_gptr_evidence_judgment") or {}
+            identity = canonicalize_url(source_url(source))
+            is_verified_source = (
+                coverage_state == "evidence_ready"
+                and identity in synthesis_source_keys
+            )
+            judged_claim_status = str(
+                judgment.get("claim_status") or ""
+            ).strip()
+            if not judged_claim_status:
+                if (
+                    judgment.get("evidence_application") == "background"
+                    or judgment.get("applicability") == "context"
+                ):
+                    judged_claim_status = "background"
+                elif judgment.get(
+                    "accepted_for_synthesis",
+                    is_verified_source,
+                ):
+                    judged_claim_status = "synthesis_ready"
+                else:
+                    judged_claim_status = "provisional"
+            judged_accepted = bool(
+                judgment.get(
+                    "accepted_for_synthesis",
+                    is_verified_source,
+                )
+            )
+            accepted_for_synthesis = (
+                is_verified_source and judged_accepted
+            )
+            claim_status = judged_claim_status
+            evidence_strength = judgment.get("evidence_strength", "")
+            effective_relabel_reason = ""
+            if (
+                judged_claim_status == "synthesis_ready"
+                and not accepted_for_synthesis
+            ):
+                claim_status = "provisional"
+                evidence_strength = "tentative"
+                effective_relabel_reason = (
+                    f"Aspect state {coverage_state} or missing usable context "
+                    "prevents this source from supporting an unqualified "
+                    "synthesis claim."
+                )
+            return {
+                "url": source_url(source),
+                "evidence_role": source.get(
+                    "_gptr_evidence_role", ""
+                ),
+                "source_tier": source_quality_tier(source),
+                "evidence_application": judgment.get(
+                    "evidence_application", "direct"
+                ),
+                "applicability": judgment.get(
+                    "applicability", "exact"
+                ),
+                "claim_status": claim_status,
+                "judged_claim_status": judged_claim_status,
+                "evidence_strength": evidence_strength,
+                "confidence": judgment.get("confidence", 0.0),
+                "confidence_label": judgment.get(
+                    "confidence_label", "low"
+                ),
+                "supported_entities": judgment.get(
+                    "supported_entities", []
+                ),
+                "supported_scope": judgment.get(
+                    "supported_scope", []
+                ),
+                "supported_claims": judgment.get(
+                    "supported_claims", []
+                ),
+                "corroborated_by": judgment.get(
+                    "corroborated_by", []
+                ),
+                "accepted_for_synthesis": accepted_for_synthesis,
+                "judged_accepted_for_synthesis": judged_accepted,
+                "effective_relabel_reason": effective_relabel_reason,
+                "reason": judgment.get("reason", ""),
+            }
+
+        verified_source_labels = [
+            source_label(source)
+            for source in synthesis_sources
+            if source_url(source)
+        ]
+        evidence_pool_source_labels = [
+            source_label(source)
+            for source in evidence_pool_sources
+            if source_url(source)
+        ]
+        background_source_labels = [
+            source
+            for source in evidence_pool_source_labels
+            if source.get("claim_status") == "background"
+        ]
+        provisional_source_labels = [
+            source
+            for source in evidence_pool_source_labels
+            if source.get("claim_status") == "provisional"
+        ]
+
         return {
             "aspect_id": aspect.get("id"),
             "parent_aspect_id": result.get("parent_aspect_id"),
@@ -1828,7 +3237,7 @@ enough."""
             ),
             "matched_scope_anchors": result.get("matched_scope_anchors", []),
             "missing_scope_anchors": result.get("missing_scope_anchors", []),
-            "state": result.get("coverage_state", "no_candidates"),
+            "state": coverage_state,
             "recovery_reason": recovery_reason,
             "repair_count": repair_count,
             "candidate_count": diagnostics.get("candidate_count", 0),
@@ -1842,35 +3251,112 @@ enough."""
             "corroboration_mode": result.get("corroboration_mode", ""),
             "verified_urls": [
                 source_url(source)
-                for source in result.get("sources") or []
+                for source in synthesis_sources
                 if source_url(source)
             ],
-            "verified_sources": [
-                {
-                    "url": source_url(source),
-                    "evidence_role": source.get(
-                        "_gptr_evidence_role", ""
-                    ),
-                    "source_tier": source_quality_tier(source),
-                    "supported_entities": (
-                        source.get("_gptr_evidence_judgment") or {}
-                    ).get("supported_entities", []),
-                    "supported_scope": (
-                        source.get("_gptr_evidence_judgment") or {}
-                    ).get("supported_scope", []),
-                    "supported_claims": (
-                        source.get("_gptr_evidence_judgment") or {}
-                    ).get("supported_claims", []),
-                }
-                for source in result.get("sources") or []
-                if source_url(source)
-            ],
+            "verified_sources": verified_source_labels,
+            "background_urls": list(
+                dict.fromkeys(
+                    source.get("url")
+                    for source in background_source_labels
+                    if source.get("url")
+                )
+            ),
+            "background_sources": background_source_labels,
+            "provisional_urls": list(
+                dict.fromkeys(
+                    source.get("url")
+                    for source in provisional_source_labels
+                    if source.get("url")
+                )
+            ),
+            "provisional_sources": provisional_source_labels,
+            "evidence_pool_urls": list(
+                dict.fromkeys(
+                    source_url(source)
+                    for source in evidence_pool_sources
+                    if source_url(source)
+                )
+            ),
+            "evidence_pool_sources": evidence_pool_source_labels,
             "retrieved_urls": [
                 source_url(source)
                 for source in result.get("attempted_sources") or []
                 if source_url(source)
             ],
         }
+
+    def _finalize_coverage_ledger(
+        self,
+        results: list[dict[str, Any]],
+        *,
+        node_id: str,
+        repair_counts: dict[str, int],
+        repair_allowance: int,
+        repairs_used: int,
+    ) -> list[dict[str, Any]]:
+        """Publish final coverage after repairs and selected deepening finish."""
+        if node_id != "root":
+            return results
+        partial_scope_results = [
+            partial
+            for result in results
+            if (partial := self._partial_scope_result(result)) is not None
+        ]
+        ledger_results = [*results, *partial_scope_results]
+        for partial in partial_scope_results:
+            self._emit_event(
+                "partial_scope_evidence",
+                {
+                    "aspect_id": (partial.get("aspect") or {}).get("id"),
+                    "parent_aspect_id": partial.get("parent_aspect_id"),
+                    "matched_scope_anchors": partial.get(
+                        "matched_scope_anchors", []
+                    ),
+                    "source_urls": [
+                        source_url(source)
+                        for source in partial.get("sources") or []
+                        if source_url(source)
+                    ],
+                },
+                node_id=partial.get("node_id", node_id),
+                parent_node_id=node_id,
+            )
+        self.coverage_ledger = [
+            self._coverage_ledger_entry(
+                result.get("aspect")
+                or {
+                    "id": f"aspect-{index + 1}",
+                    "priority": index + 1,
+                    "question": result.get("query"),
+                    "search_query": result.get("query"),
+                    "expected_evidence_type": "verified web evidence",
+                },
+                result,
+                recovery_reason=(
+                    result.get("recovery_reason")
+                    or "selective repair"
+                    if repair_counts.get(
+                        str((result.get("aspect") or {}).get("id")), 0
+                    )
+                    else result.get("recovery_reason")
+                ),
+                repair_count=repair_counts.get(
+                    str((result.get("aspect") or {}).get("id")), 0
+                ),
+            )
+            for index, result in enumerate(ledger_results)
+        ]
+        self.researcher.coverage_ledger = self.coverage_ledger
+        self._emit_event(
+            "coverage_ledger",
+            {
+                "entries": self.coverage_ledger,
+                "repair_allowance": repair_allowance,
+                "repairs_used": repairs_used,
+            },
+        )
+        return ledger_results
 
     async def deep_research(
             self,
@@ -2004,6 +3490,7 @@ enough."""
                         "excluded_candidate_urls": serp_query.get(
                             "excluded_candidate_urls", []
                         ),
+                        "subject_grounding": self.subject_grounding,
                     }
                     researcher = GPTResearcher(
                         query=serp_query['query'],
@@ -2031,6 +3518,14 @@ enough."""
                         if isinstance(context, list)
                         else (context or "")
                     )
+                    direct_sources = _direct_synthesis_sources(
+                        sources or []
+                    )
+                    direct_context = _context_for_sources(
+                        context_text,
+                        direct_sources,
+                        sources or [],
+                    )
                     conductor = getattr(researcher, "research_conductor", None)
                     if conductor is not None:
                         diagnostics = dict(
@@ -2048,9 +3543,19 @@ enough."""
                                 "accepted_count": 1 if context_text else 0
                             },
                         }
+                    coverage_context = (
+                        direct_context
+                        if direct_sources
+                        else context_text
+                    )
+                    coverage_sources = (
+                        direct_sources
+                        if direct_sources
+                        else sources or []
+                    )
                     coverage_state, coverage_details = self._coverage_state(
-                        context_text,
-                        sources or [],
+                        coverage_context,
+                        coverage_sources,
                         diagnostics,
                         aspect=serp_query.get("aspect"),
                     )
@@ -2073,7 +3578,7 @@ enough."""
                             corroboration_reason,
                             corroboration_mode,
                         ) = await self._judge_fallback_corroboration(
-                            serp_query["query"], sources or []
+                            serp_query["query"], direct_sources
                         )
                         coverage_details.update(
                             {
@@ -2101,8 +3606,8 @@ enough."""
 
                     # Broader-web material is not synthesis evidence until two
                     # independent domains corroborate the same assigned aspect.
-                    synthesis_sources = sources or []
-                    synthesis_context = context_text
+                    synthesis_sources = direct_sources
+                    synthesis_context = direct_context
                     if coverage_state != "evidence_ready":
                         synthesis_sources = []
                         synthesis_context = ""
@@ -2140,6 +3645,12 @@ enough."""
                         'node_id': branch_node_id,
                         'query': serp_query['query'],
                         'aspect': serp_query.get("aspect"),
+                        'deepening_parent_aspect_id': serp_query.get(
+                            "deepening_parent_aspect_id"
+                        ),
+                        'deepening_parent_key': serp_query.get(
+                            "deepening_parent_key"
+                        ),
                         'learnings': processed['learnings'],
                         'visited_urls': list(visited),
                         'followUpQuestions': processed['followUpQuestions'],
@@ -2149,6 +3660,7 @@ enough."""
                         'sources': synthesis_sources,
                         'attempted_context': context_text,
                         'attempted_sources': sources or [],
+                        'direct_context': direct_context,
                         'retrieval_diagnostics': diagnostics,
                         'coverage_state': coverage_state,
                         **coverage_details,
@@ -2384,68 +3896,7 @@ enough."""
                 ):
                     break
 
-        ledger_results = results
         if node_id == "root":
-            partial_scope_results = [
-                partial
-                for result in results
-                if (partial := self._partial_scope_result(result)) is not None
-            ]
-            ledger_results = [*results, *partial_scope_results]
-            for partial in partial_scope_results:
-                self._emit_event(
-                    "partial_scope_evidence",
-                    {
-                        "aspect_id": (partial.get("aspect") or {}).get("id"),
-                        "parent_aspect_id": partial.get("parent_aspect_id"),
-                        "matched_scope_anchors": partial.get(
-                            "matched_scope_anchors", []
-                        ),
-                        "source_urls": [
-                            source_url(source)
-                            for source in partial.get("sources") or []
-                            if source_url(source)
-                        ],
-                    },
-                    node_id=partial.get("node_id", node_id),
-                    parent_node_id=node_id,
-                )
-            self.coverage_ledger = [
-                self._coverage_ledger_entry(
-                    result.get("aspect") or {
-                        "id": f"aspect-{index + 1}",
-                        "priority": index + 1,
-                        "question": result.get("query"),
-                        "search_query": result.get("query"),
-                        "expected_evidence_type": "verified web evidence",
-                    },
-                    result,
-                    recovery_reason=(
-                        result.get("recovery_reason")
-                        or "selective repair"
-                        if repair_counts.get(
-                            str((result.get("aspect") or {}).get("id")), 0
-                        )
-                        else result.get("recovery_reason")
-                    ),
-                    repair_count=repair_counts.get(
-                        str((result.get("aspect") or {}).get("id")), 0
-                    ),
-                )
-                for index, result in enumerate(ledger_results)
-            ]
-            self.researcher.coverage_ledger = self.coverage_ledger
-            self._emit_event(
-                "coverage_ledger",
-                {
-                    "entries": self.coverage_ledger,
-                    "repair_allowance": repair_allowance,
-                    "repairs_used": repairs_used,
-                    "duration_seconds": round(
-                        time.perf_counter() - repair_started_at, 3
-                    ),
-                },
-            )
             self._emit_event(
                 "stage_timing",
                 {
@@ -2459,13 +3910,6 @@ enough."""
                     "repairs_used": repairs_used,
                 },
             )
-
-        local = self._merge_results(
-            ledger_results,
-            learnings,
-            citations,
-            visited_urls,
-        )
         deeper_result_sets: List[Dict[str, Any]] = []
         deepening_allowed = (
             depth > 1
@@ -2491,7 +3935,7 @@ enough."""
                 for token in _aspect_tokens(str(result.get("query") or "")):
                     token_frequency[token] = token_frequency.get(token, 0) + 1
             for index, result in enumerate(results):
-                score, metrics = self._branch_score(result)
+                evidence_score, metrics = self._branch_score(result)
                 unique_sources = sum(
                     source_frequency.get(source_url(source), 0) == 1
                     for source in result.get("sources") or []
@@ -2503,15 +3947,35 @@ enough."""
                 )
                 coverage_contribution = min(unique_sources, 3)
                 novelty = min(unique_query_terms, 4)
-                score += coverage_contribution * 3 + novelty
+                evidence_score += coverage_contribution * 3 + novelty
+                selection_score, selection_reason = (
+                    self._deepening_selection_score(
+                        result,
+                        evidence_score,
+                    )
+                )
                 metrics.update(
                     {
                         "coverage_contribution": coverage_contribution,
                         "novelty": novelty,
-                        "score": score,
+                        "score": evidence_score,
+                        "selection_score": selection_score,
+                        "selection_reason": selection_reason,
+                        "coverage_state": result.get(
+                            "coverage_state", "no_candidates"
+                        ),
+                        "aspect_priority": int(
+                            (result.get("aspect") or {}).get("priority")
+                            or 999
+                        ),
+                        "missing_scope_anchors": list(
+                            result.get("missing_scope_anchors") or []
+                        ),
                     }
                 )
-                ranked.append((score, index, result, metrics))
+                ranked.append(
+                    (selection_score, index, result, metrics)
+                )
             ranked.sort(key=lambda item: (-item[0], item[1]))
             eligible = [
                 item
@@ -2544,25 +4008,240 @@ enough."""
                         if item not in selected
                     ],
                 }, node_id=node_id, parent_node_id=parent_node_id)
-                next_queries = [
-                    f"Previous research goal: {item[2]['researchGoal']}\n"
-                    f"Follow-up questions: {' '.join(item[2]['followUpQuestions'])}"
-                    for item in selected
-                ]
+                child_branch_count = 0
                 if selected:
                     progress.current_depth += 1
-                    # Independent selected subtrees share the tree-wide semaphore.
-                    deeper_result_sets = list(await asyncio.gather(*[
-                        self.deep_research(
-                            next_query,
-                            new_breadth,
-                            new_depth,
-                            on_progress=on_progress,
-                            node_id=item[2]["node_id"],
+
+                    async def build_deepening_specs(item):
+                        parent_result = item[2]
+                        planned = await self.generate_search_queries(
+                            self._deepening_prompt(parent_result),
+                            num_queries=new_breadth,
+                        )
+                        aspect = parent_result.get("aspect") or {}
+                        parent_aspect_id = str(aspect.get("id") or "")
+                        parent_key = (
+                            parent_aspect_id
+                            or str(parent_result.get("node_id") or "")
+                        )
+                        specs = []
+                        for child_index, child in enumerate(planned, start=1):
+                            original_candidate = str(
+                                child.get("query") or ""
+                            ).strip()
+                            candidate = original_candidate
+                            guard_state = "accepted"
+                            if not _queries_are_anchored(
+                                candidate,
+                                str(
+                                    aspect.get("question")
+                                    or parent_result.get("query")
+                                    or ""
+                                ),
+                                self.original_query,
+                            ):
+                                candidate = (
+                                    f"{self.original_query} {candidate}"
+                                ).strip()
+                                guard_state = "rewritten"
+                            self._emit_event(
+                                "child_query_guard",
+                                {
+                                    "state": guard_state,
+                                    "assigned_aspect": aspect,
+                                    "original_query": self.original_query,
+                                    "query": original_candidate,
+                                    "rewritten_query": (
+                                        candidate
+                                        if guard_state == "rewritten"
+                                        else ""
+                                    ),
+                                },
+                                node_id=parent_result["node_id"],
+                                parent_node_id=node_id,
+                            )
+                            specs.append(
+                                {
+                                    **child,
+                                    "query": candidate,
+                                    "aspect": aspect,
+                                    "node_id": (
+                                        f"{parent_result['node_id']}.deep"
+                                        f"{child_index}"
+                                    ),
+                                    "deepening_parent_aspect_id": (
+                                        parent_aspect_id
+                                    ),
+                                    "deepening_parent_key": parent_key,
+                                    "excluded_candidate_urls": [
+                                        source_url(source)
+                                        for source in parent_result.get(
+                                            "attempted_sources"
+                                        )
+                                        or []
+                                        if source_url(source)
+                                    ],
+                                }
+                            )
+                        return specs
+
+                    spec_groups = await asyncio.gather(
+                        *[
+                            build_deepening_specs(item)
+                            for item in selected
+                        ]
+                    )
+                    deepening_specs = [
+                        spec for group in spec_groups for spec in group
+                    ]
+                    child_results = await asyncio.gather(
+                        *[
+                            process_query(
+                                len(serp_queries) + index,
+                                spec,
+                            )
+                            for index, spec in enumerate(deepening_specs)
+                        ]
+                    )
+                    child_results = [
+                        result
+                        for result in child_results
+                        if result is not None
+                    ]
+                    child_branch_count = len(child_results)
+                    children_by_aspect: dict[
+                        str, list[dict[str, Any]]
+                    ] = {}
+                    for child in child_results:
+                        children_by_aspect.setdefault(
+                            str(
+                                child.get(
+                                    "deepening_parent_key"
+                                )
+                                or (child.get("aspect") or {}).get("id")
+                                or child.get("node_id")
+                                or ""
+                            ),
+                            [],
+                        ).append(child)
+                    updated_results = []
+                    for result in results:
+                        aspect_id = str(
+                            (result.get("aspect") or {}).get("id")
+                            or result.get("node_id")
+                            or ""
+                        )
+                        children = children_by_aspect.get(
+                            aspect_id, []
+                        )
+                        if not children:
+                            updated_results.append(result)
+                            continue
+                        original_result = result
+                        combined = result
+                        for child in children:
+                            combined = self._combine_repair_evidence(
+                                combined,
+                                child,
+                            )
+                        combined.update(
+                            {
+                                "node_id": original_result.get(
+                                    "node_id"
+                                ),
+                                "query": original_result.get("query"),
+                                "researchGoal": original_result.get(
+                                    "researchGoal"
+                                ),
+                                "aspect": original_result.get("aspect"),
+                                "learnings": list(
+                                    dict.fromkeys(
+                                        [
+                                            *(
+                                                original_result.get(
+                                                    "learnings"
+                                                )
+                                                or []
+                                            ),
+                                            *[
+                                                learning
+                                                for child in children
+                                                for learning in (
+                                                    child.get("learnings")
+                                                    or []
+                                                )
+                                            ],
+                                        ]
+                                    )
+                                ),
+                                "citations": {
+                                    **(
+                                        original_result.get("citations")
+                                        or {}
+                                    ),
+                                    **{
+                                        key: value
+                                        for child in children
+                                        for key, value in (
+                                            child.get("citations") or {}
+                                        ).items()
+                                    },
+                                },
+                                "visited_urls": list(
+                                    dict.fromkeys(
+                                        [
+                                            *(
+                                                original_result.get(
+                                                    "visited_urls"
+                                                )
+                                                or []
+                                            ),
+                                            *[
+                                                url
+                                                for child in children
+                                                for url in (
+                                                    child.get(
+                                                        "visited_urls"
+                                                    )
+                                                    or []
+                                                )
+                                            ],
+                                        ]
+                                    )
+                                ),
+                                "deepening_children": [
+                                    child.get("query")
+                                    for child in children
+                                ],
+                            }
+                        )
+                        self._emit_event(
+                            "deepening_outcome",
+                            {
+                                "aspect_id": aspect_id,
+                                "previous_state": original_result.get(
+                                    "coverage_state"
+                                ),
+                                "final_state": combined.get(
+                                    "coverage_state"
+                                ),
+                                "child_queries": combined.get(
+                                    "deepening_children", []
+                                ),
+                                "evidence_pool_count": len(
+                                    combined.get("attempted_sources") or []
+                                ),
+                                "synthesis_source_count": len(
+                                    combined.get("sources") or []
+                                ),
+                            },
+                            node_id=original_result.get(
+                                "node_id", node_id
+                            ),
                             parent_node_id=node_id,
                         )
-                        for item, next_query in zip(selected, next_queries)
-                    ]))
+                        updated_results.append(combined)
+                    results = updated_results
             else:
                 # The legacy tree deepens every evidence-bearing branch in
                 # deterministic order, matching upstream's serial child waves.
@@ -2616,11 +4295,28 @@ enough."""
                         "deepening"
                     ),
                     "selected_branch_count": len(selected),
-                    "child_branch_count": len(deeper_result_sets) * new_breadth,
+                    "child_branch_count": (
+                        child_branch_count
+                        if ranked_tree
+                        else len(deeper_result_sets) * new_breadth
+                    ),
                 },
                 node_id=node_id,
                 parent_node_id=parent_node_id,
             )
+        ledger_results = self._finalize_coverage_ledger(
+            results,
+            node_id=node_id,
+            repair_counts=repair_counts,
+            repair_allowance=repair_allowance,
+            repairs_used=repairs_used,
+        )
+        local = self._merge_results(
+            ledger_results,
+            learnings,
+            citations,
+            visited_urls,
+        )
         merged = self._merge_results(
             [local, *deeper_result_sets],
             visited_urls=self.visited_urls,
@@ -2667,6 +4363,7 @@ enough."""
             "depth": self.depth,
             "tree_policy": self.tree_policy,
             "branch_mode": self.branch_mode,
+            "deepening_strategy": self.deepening_strategy,
             "concurrency_limit": self.concurrency_limit,
             "max_deepened_branches": self.max_deepened_branches,
             "minimum_deepening_score": getattr(
@@ -2815,14 +4512,15 @@ enough."""
             root_queries = root_queries[1:]
 
         if root_queries:
-            results = await self.deep_research(
-                query=self.researcher.query,
-                breadth=len(root_queries),
-                depth=self.depth,
-                on_progress=on_progress,
-                node_id="root",
-                serp_queries_override=root_queries,
-            )
+            with subject_grounding_context(self.subject_grounding):
+                results = await self.deep_research(
+                    query=self.researcher.query,
+                    breadth=len(root_queries),
+                    depth=self.depth,
+                    on_progress=on_progress,
+                    node_id="root",
+                    serp_queries_override=root_queries,
+                )
         else:
             results = {
                 "learnings": [],
@@ -2924,6 +4622,12 @@ enough."""
                         "corroborated",
                         "verified_urls",
                         "verified_sources",
+                        "background_urls",
+                        "background_sources",
+                        "provisional_urls",
+                        "provisional_sources",
+                        "evidence_pool_urls",
+                        "evidence_pool_sources",
                     )
                 }
                 for item in self.coverage_ledger
@@ -2932,12 +4636,21 @@ enough."""
                 "EVIDENCE COVERAGE LEDGER (authoritative workflow metadata, "
                 "not factual evidence):\n"
                 + json.dumps(writer_ledger, ensure_ascii=False)
-                + "\nUse factual material only from evidence_ready aspects. "
-                "Explicitly state unresolved gaps; never resolve them from model "
-                "knowledge. Do not call fallback sources primary, generalize "
-                "beyond matched scope anchors, merge distinct evidence roles, "
-                "or reclassify adjacent causes, effects, risks, mitigations, or "
-                "correlations as the relationship asked by the user."
+                + "\nState unqualified facts only from synthesis-ready evidence "
+                "in evidence_ready aspects. Evidence-pool entries labeled "
+                "provisional may be preserved only as explicitly attributed "
+                "tentative or practitioner observations; background entries may "
+                "orient but may not answer an unresolved aspect. Explicitly "
+                "state unresolved gaps; never resolve them from model knowledge. "
+                "Do not call fallback sources primary, generalize beyond matched "
+                "scope anchors, merge distinct evidence roles, or reclassify "
+                "adjacent causes, effects, risks, mitigations, or correlations "
+                "as the relationship asked by the user. Keep every supported "
+                "claim attached to its supported_entities and applicability "
+                "label. A feature of one tool, interface, product, version, "
+                "population, region, or method describes that named subject; it "
+                "transfers only when a direct evidence claim names the "
+                "relationship."
             )
 
         # Trim final context to word limit

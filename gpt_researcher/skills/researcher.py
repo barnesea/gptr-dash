@@ -35,6 +35,7 @@ from ..actions.retrieval_pipeline import (
     canonicalize_url,
     cosine_similarity,
     evidence_role,
+    label_evidence_judgment,
     lexical_collision,
     meaningful_tokens,
     roles_cover_aspect,
@@ -1940,8 +1941,10 @@ class ResearchConductor:
         if judge_enabled and accepted:
             accepted = await self._judge_evidence_sources(query, accepted)
 
-        # Unlike the legacy browser path, only verified pages are exposed in
-        # get_research_sources() and therefore to the final report writer.
+        # Unlike the legacy browser path, pages exposed here have passed hard
+        # content integrity. In labeled-pool mode they may still be
+        # synthesis-ready, provisional, or background evidence; the label is
+        # preserved for downstream claim handling.
         self.researcher.add_research_sources(accepted)
         event = {
             "query": query,
@@ -1963,7 +1966,10 @@ class ResearchConductor:
         await stream_output(
             "logs",
             "post_scrape_source_integrity",
-            f"🛡️ Verified {len(accepted)}/{len(scraped_content)} fetched pages before using them as evidence.",
+            (
+                f"🛡️ Retained {len(accepted)}/{len(scraped_content)} fetched "
+                "pages with evidence labels."
+            ),
             self.researcher.websocket,
             True,
             event,
@@ -2078,6 +2084,51 @@ class ResearchConductor:
             parsed[source_id] = {
                 "supports_aspect": supported,
                 "confidence": max(0.0, min(confidence, 1.0)),
+                "evidence_application": (
+                    str(
+                        value.get("evidence_application")
+                        or value.get("application")
+                        or ("direct" if supported else "unrelated")
+                    )
+                    .strip()
+                    .lower()
+                    if str(
+                        value.get("evidence_application")
+                        or value.get("application")
+                        or ("direct" if supported else "unrelated")
+                    )
+                    .strip()
+                    .lower()
+                    in {"direct", "background", "unrelated"}
+                    else ("direct" if supported else "unrelated")
+                ),
+                "applicability": (
+                    str(value.get("applicability") or "")
+                    .strip()
+                    .lower()
+                    if str(value.get("applicability") or "")
+                    .strip()
+                    .lower()
+                    in {
+                        "exact",
+                        "partial",
+                        "adjacent",
+                        "context",
+                        "unrelated",
+                    }
+                    else (
+                        "context"
+                        if str(
+                            value.get("evidence_application")
+                            or value.get("application")
+                            or ""
+                        ).strip().lower()
+                        == "background"
+                        else "exact"
+                        if supported
+                        else "unrelated"
+                    )
+                ),
                 "evidence_role": (
                     str(value.get("evidence_role") or "")
                     .strip()
@@ -2123,6 +2174,15 @@ class ResearchConductor:
     async def _judge_evidence_sources(self, query, sources):
         """Judge every hard-valid source in one bounded call for this aspect."""
         started_at = time.perf_counter()
+        deduplicated_sources = []
+        seen_urls: set[str] = set()
+        for source in sources:
+            identity = canonicalize_url(source_url(source))
+            if not identity or identity in seen_urls:
+                continue
+            seen_urls.add(identity)
+            deduplicated_sources.append(source)
+        sources = deduplicated_sources
         excerpts = await self._evidence_judge_excerpts(query, sources)
         aspect = getattr(self.researcher, "research_aspect", {}) or {}
         cards = [
@@ -2148,6 +2208,8 @@ class ResearchConductor:
             "Return JSON only: "
             '{"sources":[{"id":1,"supports_aspect":true,'
             '"confidence":0.0,"evidence_role":"reputable_secondary",'
+            '"evidence_application":"direct|background|unrelated",'
+            '"applicability":"exact|partial|adjacent|context|unrelated",'
             '"supported_entities":[],'
             '"supported_scope":[],"supported_claims":[],'
             '"corroborated_by":[2],'
@@ -2160,7 +2222,26 @@ class ResearchConductor:
             "established accountable organization or publication. Hosting on "
             "GitHub or Hugging Face alone does not establish authority. The "
             "deterministic first_party/original role is provenance metadata; "
-            "do not invent either role for a source marked practitioner."
+            "do not invent either role for a source marked practitioner. "
+            "List the exact subject names that the source actually discusses "
+            "in supported_entities. Write every supported_claim with its "
+            "subject named, so a general method or a method for one product "
+            "stays attached to that product. Use evidence_application=direct "
+            "when the source itself supplies concrete evidence for any "
+            "material part of the assigned relationship or workflow; list "
+            "only the portion actually supported, even when the rest of the "
+            "aspect remains uncovered. Use background when it only defines a "
+            "component, recommends a tool, or covers an adjacent interface "
+            "without supplying a requested workflow fact. Use unrelated when "
+            "it supplies neither. Set applicability=exact only when the source "
+            "matches the assigned subject, relationship, and material scope; "
+            "partial when it directly supports only a named portion; adjacent "
+            "when it covers a related variant, version, mode, population, "
+            "region, artifact subtype, or operation; context when it only "
+            "defines or orients; and unrelated when it does not help. "
+            "Background, adjacent, and partial evidence may still contain "
+            "useful claims, so label those claims and entities instead of "
+            "erasing them."
         )
         judgments = None
         errors: list[str] = []
@@ -2272,6 +2353,32 @@ class ResearchConductor:
                 or bool(current_claims & other_claims)
             )
 
+        configured_labeled_pool = getattr(
+            self.researcher.cfg,
+            "labeled_evidence_pool_enabled",
+            None,
+        )
+        retain_labeled_pool = (
+            bool(configured_labeled_pool)
+            if configured_labeled_pool is not None
+            else str(
+                getattr(self.researcher, "research_mode", "")
+            ).startswith("deep_branch")
+        )
+        minimum_labeled_confidence = max(
+            0.0,
+            min(
+                float(
+                    getattr(
+                        self.researcher.cfg,
+                        "labeled_evidence_min_confidence",
+                        0.20,
+                    )
+                ),
+                1.0,
+            ),
+        )
+        synthesis_count = 0
         for index, source in enumerate(sources, start=1):
             if judgments is None:
                 supports = hybrid_support.get(index, False)
@@ -2286,6 +2393,12 @@ class ResearchConductor:
                 judgment = {
                     "supports_aspect": supports,
                     "confidence": 0.45 if supports else 0.0,
+                    "evidence_application": (
+                        "direct" if supports else "unrelated"
+                    ),
+                    "applicability": (
+                        "exact" if supports else "unrelated"
+                    ),
                     "evidence_role": str(
                         source.get("_gptr_evidence_role")
                         or "practitioner"
@@ -2306,6 +2419,8 @@ class ResearchConductor:
                 supports = (
                     judgment["supports_aspect"]
                     and judgment["confidence"] >= 0.35
+                    and judgment.get("evidence_application")
+                    != "unrelated"
                 )
             deterministic_role = str(
                 source.get("_gptr_evidence_role") or "practitioner"
@@ -2328,15 +2443,23 @@ class ResearchConductor:
                 "reject": "reject",
             }[resolved_role]
             judgment["resolved_evidence_role"] = resolved_role
-            supports = supports and resolved_role != "reject"
-            if resolved_role == "practitioner" and supports:
+            directly_supported = supports and resolved_role != "reject"
+            synthesis_eligible = (
+                directly_supported
+                and judgment.get("evidence_application") == "direct"
+                and judgment.get("applicability", "exact")
+                in {"exact", "partial"}
+            )
+            if resolved_role == "practitioner" and synthesis_eligible:
                 if judgments is None:
-                    supports = bool(judgment.get("corroborated_by"))
+                    synthesis_eligible = bool(
+                        judgment.get("corroborated_by")
+                    )
                 else:
                     corroborating_ids = judgment.get(
                         "corroborated_by", []
                     )
-                    supports = any(
+                    synthesis_eligible = any(
                         valid_model_corroborator(
                             index,
                             source_id,
@@ -2344,19 +2467,61 @@ class ResearchConductor:
                         )
                         for source_id in corroborating_ids
                     )
-                    if not supports:
+                    if not synthesis_eligible:
                         judgment["reason"] = (
                             judgment.get("reason", "")
                             + " Practitioner evidence lacks independent "
                             "claim-level corroboration."
                         ).strip()
+            judgment.update(
+                label_evidence_judgment(
+                    judgment,
+                    resolved_role=resolved_role,
+                    synthesis_eligible=synthesis_eligible,
+                )
+            )
+            labeled_background = (
+                judgment.get("claim_status") == "background"
+                and bool(
+                    judgment.get("supported_entities")
+                    or judgment.get("supported_scope")
+                    or judgment.get("supported_claims")
+                )
+                and resolved_role != "reject"
+            )
+            retained_in_pool = (
+                synthesis_eligible
+                or (
+                    retain_labeled_pool
+                    and resolved_role != "reject"
+                    and judgment.get("evidence_application")
+                    != "unrelated"
+                    and judgment.get("applicability") != "unrelated"
+                    and (
+                        labeled_background
+                        or float(judgment.get("confidence") or 0.0)
+                        >= minimum_labeled_confidence
+                    )
+                    and (
+                        directly_supported
+                        or labeled_background
+                        or bool(
+                            judgment.get("supported_entities")
+                            or judgment.get("supported_scope")
+                            or judgment.get("supported_claims")
+                        )
+                    )
+                )
+            )
             source["_gptr_evidence_judgment"] = judgment
             source["_gptr_judge_fallback"] = fallback_used
             judgment["aspect_id"] = str(aspect.get("id") or "")
-            judgment["accepted_for_synthesis"] = supports
+            judgment["accepted_for_synthesis"] = synthesis_eligible
+            judgment["retained_in_evidence_pool"] = retained_in_pool
+            synthesis_count += int(synthesis_eligible)
             if ledger is not None:
                 ledger.record_judgment(source_url(source), judgment)
-            if supports:
+            if retained_in_pool:
                 accepted.append(source)
             else:
                 rejected.append(
@@ -2371,6 +2536,8 @@ class ResearchConductor:
             "aspect_id": str(aspect.get("id") or ""),
             "source_count": len(sources),
             "accepted_count": len(accepted),
+            "synthesis_count": synthesis_count,
+            "evidence_pool_count": len(accepted),
             "rejected_count": len(rejected),
             "fallback_used": fallback_used,
             "fallback_mode": fallback_mode if fallback_used else "",
@@ -2386,6 +2553,9 @@ class ResearchConductor:
         self.last_retrieval_diagnostics[
             "evidence_judge_accepted_count"
         ] = len(accepted)
+        self.last_retrieval_diagnostics[
+            "evidence_judge_synthesis_count"
+        ] = synthesis_count
         self.last_retrieval_diagnostics[
             "evidence_judge_rejected_count"
         ] = len(rejected)

@@ -353,6 +353,36 @@ def render_compact_query(
 ) -> str:
     """Render an entity-first query instead of forwarding planner prose."""
     entities = normalize_entities(aspect.get("entities") or [])
+    planned_query = " ".join(
+        str(aspect.get("search_query") or "").split()
+    ).strip(" ,:;-")
+    planned_terms = meaningful_tokens(planned_query)
+    planned_lower = planned_query.lower()
+    planned_entity_matches = sum(
+        str(entity["name"]).lower() in planned_lower
+        for entity in entities
+    )
+    has_search_operator = bool(
+        re.search(
+            r"(?:^|\s)(?:site|filetype|inurl|intitle):\S+",
+            planned_query,
+            flags=re.IGNORECASE,
+        )
+    )
+    # A validated planner query already contains the useful relationship words
+    # in natural order. Preserve it when it is compact and names the subject;
+    # reconstruct only verbose, unanchored, or operator-heavy queries.
+    if (
+        planned_query
+        and not has_search_operator
+        and 2 <= len(planned_terms) <= max_terms
+        and (
+            not entities
+            or planned_entity_matches >= min(2, len(entities))
+        )
+    ):
+        return planned_query
+
     parts: list[str] = []
     term_count = 0
     for entity in entities[:3]:
@@ -668,6 +698,78 @@ def missing_evidence_roles(
     ]
 
 
+def label_evidence_judgment(
+    judgment: dict[str, Any],
+    *,
+    resolved_role: str,
+    synthesis_eligible: bool,
+) -> dict[str, str]:
+    """Derive stable labels while preserving the judge's numeric confidence."""
+    try:
+        confidence = max(
+            0.0,
+            min(float(judgment.get("confidence") or 0.0), 1.0),
+        )
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence_label = (
+        "high"
+        if confidence >= 0.75
+        else "medium"
+        if confidence >= 0.50
+        else "low"
+    )
+    application = str(
+        judgment.get("evidence_application") or "unrelated"
+    ).strip().lower()
+    applicability = str(
+        judgment.get("applicability") or ""
+    ).strip().lower()
+    if applicability not in {
+        "exact",
+        "partial",
+        "adjacent",
+        "context",
+        "unrelated",
+    }:
+        applicability = {
+            "direct": "exact",
+            "background": "context",
+            "unrelated": "unrelated",
+        }.get(application, "unrelated")
+
+    if (
+        resolved_role == "reject"
+        or application == "unrelated"
+        or applicability == "unrelated"
+    ):
+        claim_status = "excluded"
+        evidence_strength = "excluded"
+    elif synthesis_eligible:
+        claim_status = "synthesis_ready"
+        evidence_strength = (
+            "strong"
+            if confidence >= 0.75
+            and resolved_role
+            in {"first_party", "original", "reputable_secondary"}
+            else "moderate"
+        )
+    elif application == "background" or applicability == "context":
+        claim_status = "background"
+        evidence_strength = "context_only"
+    else:
+        claim_status = "provisional"
+        evidence_strength = (
+            "moderate" if confidence >= 0.65 else "tentative"
+        )
+    return {
+        "claim_status": claim_status,
+        "evidence_strength": evidence_strength,
+        "confidence_label": confidence_label,
+        "applicability": applicability,
+    }
+
+
 @dataclass
 class EvidenceCandidate:
     candidate_id: str
@@ -801,11 +903,27 @@ class EvidenceCandidateLedger:
                 if exclude_failed and (
                     (
                         aspect_judgments
-                        and not aspect_judgments[-1].get(
-                            "accepted_for_synthesis",
-                            aspect_judgments[-1].get(
-                                "supports_aspect", False
-                            ),
+                        and (
+                            aspect_judgments[-1].get("claim_status")
+                            == "excluded"
+                            or aspect_judgments[-1].get(
+                                "evidence_application"
+                            )
+                            == "unrelated"
+                            or aspect_judgments[-1].get(
+                                "resolved_evidence_role"
+                            )
+                            == "reject"
+                            or (
+                                "claim_status"
+                                not in aspect_judgments[-1]
+                                and aspect_judgments[-1].get(
+                                    "accepted_for_synthesis"
+                                )
+                                is False
+                                and "evidence_application"
+                                not in aspect_judgments[-1]
+                            )
                         )
                     )
                     or (
@@ -894,7 +1012,35 @@ class EvidenceCandidateLedger:
         with self._lock:
             entry = self._by_url.get(canonical)
             if entry:
-                entry.judgments.append(deepcopy(judgment))
+                recorded = deepcopy(judgment)
+                aspect_id = str(recorded.get("aspect_id") or "")
+                previous = next(
+                    (
+                        value
+                        for value in reversed(entry.judgments)
+                        if str(value.get("aspect_id") or "") == aspect_id
+                    ),
+                    None,
+                )
+                recorded["revision"] = (
+                    int((previous or {}).get("revision") or 0) + 1
+                )
+                if previous is not None:
+                    recorded["previous_label"] = {
+                        key: previous.get(key)
+                        for key in (
+                            "claim_status",
+                            "evidence_strength",
+                            "confidence",
+                            "confidence_label",
+                            "applicability",
+                        )
+                    }
+                    recorded["relabel_reason"] = str(
+                        recorded.get("relabel_reason")
+                        or "new evidence judgment for the same source and aspect"
+                    )
+                entry.judgments.append(recorded)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

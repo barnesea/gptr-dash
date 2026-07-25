@@ -17,6 +17,8 @@ from ..actions import (
 from ..actions.report_generation import (
     add_visible_evidence_limitation,
     enforce_verified_citation_urls,
+    qualify_supplemental_evidence_paragraphs,
+    qualify_uncited_synthesis_paragraphs,
     repair_report_evidence_safety,
     report_citation_urls,
     report_quality_diagnostics,
@@ -129,7 +131,31 @@ class ReportGenerator:
             getattr(self.researcher, "coverage_ledger", []) or []
         )
         report_params["coverage_ledger"] = coverage_ledger
-        if coverage_ledger and not verified_source_urls:
+        supplemental_source_urls = list(
+            dict.fromkeys(
+                str(source.get("url") or "").strip()
+                for item in coverage_ledger
+                for source in item.get("evidence_pool_sources", [])
+                if str(source.get("url") or "").strip()
+                and source.get("claim_status")
+                in {"provisional", "background"}
+                and str(source.get("url") or "").strip()
+                not in verified_source_urls
+            )
+        )
+        report_params["supplemental_source_urls"] = (
+            supplemental_source_urls
+        )
+        citation_source_urls = list(
+            dict.fromkeys(
+                [*verified_source_urls, *supplemental_source_urls]
+            )
+        )
+        if (
+            coverage_ledger
+            and not verified_source_urls
+            and not supplemental_source_urls
+        ):
             unresolved = [
                 str(item.get("aspect_id") or "unknown")
                 for item in coverage_ledger
@@ -159,13 +185,14 @@ class ReportGenerator:
         citations_before = report_citation_urls(report)
         report = enforce_verified_citation_urls(
             report,
-            verified_source_urls,
+            citation_source_urls,
         )
         quality_before = (
             report_quality_diagnostics(
                 report,
                 coverage_ledger,
                 query=self.researcher.query,
+                supplemental_source_urls=supplemental_source_urls,
             )
             if coverage_ledger
             else {"passes": True, "issues": []}
@@ -178,6 +205,7 @@ class ReportGenerator:
                     query=self.researcher.query,
                     coverage_ledger=coverage_ledger,
                     verified_source_urls=verified_source_urls,
+                    supplemental_source_urls=supplemental_source_urls,
                     diagnostics=quality_before,
                     cfg=self.researcher.cfg,
                     cost_callback=self.researcher.add_costs,
@@ -185,19 +213,40 @@ class ReportGenerator:
                 )
                 report = enforce_verified_citation_urls(
                     corrected,
-                    verified_source_urls,
+                    citation_source_urls,
                 )
                 correction_used = True
             except Exception:
                 correction_used = False
+        quality_after_correction = (
+            report_quality_diagnostics(
+                report,
+                coverage_ledger,
+                query=self.researcher.query,
+                supplemental_source_urls=supplemental_source_urls,
+            )
+            if coverage_ledger
+            else quality_before
+        )
+        unlabeled_before_deterministic_pass = len(
+            quality_after_correction.get(
+                "unlabeled_supplemental_paragraphs", []
+            )
+        )
+        report = qualify_supplemental_evidence_paragraphs(
+            report,
+            coverage_ledger,
+        )
+        report = qualify_uncited_synthesis_paragraphs(report)
         quality_after = (
             report_quality_diagnostics(
                 report,
                 coverage_ledger,
                 query=self.researcher.query,
+                supplemental_source_urls=supplemental_source_urls,
             )
             if coverage_ledger
-            else quality_before
+            else quality_after_correction
         )
         if not quality_after["passes"]:
             report = add_visible_evidence_limitation(report, quality_after)
@@ -208,16 +257,19 @@ class ReportGenerator:
                 "report_citation_guard",
                 {
                     "verified_source_count": len(verified_source_urls),
+                    "supplemental_source_count": len(
+                        supplemental_source_urls
+                    ),
                     "citation_count_before": len(citations_before),
                     "citation_count_after": len(citations_after),
                     "removed_or_rewritten_count": len(
                         citations_before - citations_after
                     ),
-                    "all_citations_verified": all(
+                    "all_citations_allowlisted": all(
                         any(
                             citation.rstrip("/").lower()
                             == source.rstrip("/").lower()
-                            for source in verified_source_urls
+                            for source in citation_source_urls
                         )
                         for citation in citations_after
                     ),
@@ -229,6 +281,15 @@ class ReportGenerator:
                     "before": quality_before,
                     "after": quality_after,
                     "correction_used": correction_used,
+                    "deterministic_supplemental_labels_added": max(
+                        0,
+                        unlabeled_before_deterministic_pass
+                        - len(
+                            quality_after.get(
+                                "unlabeled_supplemental_paragraphs", []
+                            )
+                        ),
+                    ),
                     "visible_limitation_added": not quality_after["passes"],
                 },
             )
